@@ -1,0 +1,50 @@
+Dan Gray
+Mark Hauschild
+OS - Project 5 - Memory Management
+
+This program creates multiple children, only allowing so many to run at a time. It also takes memory 
+requests from them for a frame in RAM. It puts the Frame Id in their page table, suspends the process, 
+and brings the frame into memory on a page fault.  It also checks to see if all processes are suspended 
+at once. If they are, it will fulfill the request at the head of the suspended queue and continue.  
+When children decide they are ready to terminate, they signal OSS which waits for the process to finish, 
+deallocates their memory, writes their termination time and Effective Access Time to log.txt, and removes
+the process from the Process Table.  The program terminates after 6 seconds and prints off the statistics
+for each process and all the process' cummulative statistics.  Interrupts are handled, don't interrupt
+the parent...
+
+Commands to run program:
+        1) make oss
+        2) make process
+        3) oss (this executes the program)
+
+Optional arguments:
+	-s (num)     Sets the total number of processes to run concurrently
+	-p (num)     How often the Memory Map will print in seconds.  Recommend 0.5 or below for more feedback.
+	-t           Daemon mode, guarantees seeing Daemon in action. fork() not timed, all Process PTLR's = 32 to fill Memory fast.
+		     Memory Map will print a lot, when you see different colored 1's you know their valid bit is off.
+	             CTRL-C to stop the program to look at the bits or run til' the end and scroll back to see.
+	             Do Not use in conjunction with -s argument. ***Warning*** This prints A LOT.
+	-v           Sets the program to Verbose mode.  This will print the Memory Map on every memory access
+	             and print each Processes Page Table (In a different color) on every Page Fault.
+	             **WARNING** This prints A LOT.  Please make sure your computer can handle it before taking the plunge!
+
+Placed the following "Print Memory Map" code several times between each if statement in OSS's main loop so that 
+memory map printed on time.  OSS will get caught up doing work in each if statement and can leave the Memory Map 
+not printed until much later. I also made it print out every 1/2 second, it hardly prints otherwise.
+if(totalTime - timePassed > 0.5){
+	fprintf(stdout,"Printing Memory Map: Time left: %.9f\n", (double)runTime - totalTime);
+	printBit(RAM, 32, PT->valid);
+	timePassed = getTotalTime(&timer->clockSecs, &timer->clockNanos, &timePassed);
+}
+
+I also noticed that unless you print the memory map on every memory request, it's extremely hard to see the processes 
+claiming memory and it's hard to see the Daemon function flipping the valid bit.  So I made optional arguments for showing
+this easier if the user decides to use them.  Downside to them is they well print A LOT, like the matrix flying up
+your screen a lot.
+
+I did leave some feedback printing to the screen so the user can tell the program is still running:
+	-Prints when new child
+	-When child Not terminating
+	-When child terminating, also shows child removed from process table at this time  
+	-"OSS Running..." every 500000 iterations
+

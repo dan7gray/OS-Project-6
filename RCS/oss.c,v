@@ -1,0 +1,2328 @@
+head	1.5;
+access;
+symbols;
+locks
+	o2-gray:1.5; strict;
+comment	@ * @;
+
+
+1.5
+date	2016.04.26.15.02.34;	author o2-gray;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2016.04.24.03.16.06;	author o2-gray;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2016.04.23.21.14.26;	author o2-gray;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2016.04.20.03.18.00;	author o2-gray;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2016.04.17.02.37.48;	author o2-gray;	state Exp;
+branches;
+next	;
+
+
+desc
+@Laid out the framework and put easy stuff that doesn't rely on the page table in.
+Instructions are extremely vague, so much that we can't understand what is expected of us
+or how anything should work. I spent 3 1/2 hours discussing this with a classmate.  The only
+conclusion we came to was this is very poor instructions and I personally think it's very 
+unproffesional.  I don't want stuff spelled out for me, I want to learn, but I can't learn
+when so much literally doesn't make sense.  Waste of my study time and time I could be 
+progressing on this project. Thanks!
+@
+
+
+1.5
+log
+@Have OSS and Processes communicating good now.  Need to make sure nextIndex
+function that searches the RAM for an empty spot to hold a new process
+with it's given amount of frames is working.  Then EAT for each process 
+when they write to the log, then done!
+@
+text
+@#include "functs.h"
+
+int semKey = 8675309, semId;//For clock
+int semKeyR = 3333333, semIdR;//For Removing processes
+int semKeyReq = 7777777, semIdReq;//For Requesting memory in process.c
+int semKeyCond = 90210, semIdCond;//For processes requesting resources
+int key = 4444444;
+int key2 = 5555555;
+int key3 = 6666666;
+int shmidVal;
+int shmidVal2;
+int shmidVal3;
+
+int main(int argc, char * argv[]){
+/*******************************************************************************************
+Initialize vars.  totalNumAllowed, numAllowedConcurrently, & runTime can be modified safely
+*******************************************************************************************/
+int p, r;//for loop vars
+double runTime = 10;//Time the program can run until in stops (seconds)
+double total = 0;//For statistics at end
+int numProc = 0;//For statistics at end
+bool resources = true;
+int totalSuspended = 0;//Keep track of number of page faults
+int pageFaults = 0, memoryAccesses = 0;//Keep track of number of page faults
+int numberCompleted = 0;//Keep track of number of processes complete for calculations at the end
+int processRemoved = -1, id, signaling, taken, pageReturned;
+int processId = 0, processCounter = 0, processToRunId = -1, processRequestId = -1, nextIndex = 0, freeFrames = 0;
+pid_t procPid, waitingPid;
+int status;
+double timePassed = 0, totalTime = 0, prevTotalTime = 0, daemonTime = 0;
+double randTime;//Timing for when to generate next process
+srand(time(NULL));
+char writeString[100];//For writing to log file
+char tempProcessId[sizeof(int)];//For sending processId through execl 
+char tempShmidVal[sizeof(int)];//For sending shmidVal through execl 
+char tempShmidVal2[sizeof(int)];//For sending shmidVal2 through execl tempPriority
+char tempShmidVal3[sizeof(int)];//For sending shmidVal2 through execl tempPriority
+
+initSigHandler();//Initialize signal handler
+
+struct PCB *processBlock;
+struct timing *timer;
+struct pageTable *PT;
+
+unsigned int bv[1] = {0};//bv = bitVector. keep track of PCBs taken. Process table
+unsigned int RAM[8] = {0};//256KB available in system memory. Bit vector
+
+//Vars for getopts
+int totalNumAllowed;//Number of processes allowing to be created
+long count2;
+char *count, *q;
+int hflag = 0, sflag = 0, c = 0, err = 0;
+extern char *optarg; //used when parsing options that take a name, stores parameters
+extern int optind; //current index into main functions argument list
+//Used to find arguments after all the option processing is done
+//command line options get suffixed by a : if they require a parameter
+
+while((c = getopt(argc, argv, "hs:")) != -1){//-1 when no more options found
+	switch(c){
+	case 'h':
+		hflag = 1;
+		break;
+	case 's':
+		sflag = 1;
+		count = optarg;
+		break;
+	case '?'://Option not in the list
+		err = 1;
+		break;
+	}
+}
+
+if(sflag == 1){//Set the number of Processes
+	count2 = strtol(count,&q,10);
+	if(count2 > 18){
+		fprintf(stdout,"Let's not go too crazy here.  How about 18 children instead :D\n");
+		totalNumAllowed = HARD_LIMIT;
+	}else{
+		totalNumAllowed = count2;
+	}
+}else{
+	totalNumAllowed = SOFT_LIMIT;//+1 to take account of master process
+}
+
+if(hflag == 1){//Display info
+	fprintf(stdout,"The program will spawn a number of children and let them take turns requesting memory.\n");
+	fprintf(stdout,"If the time runs out, they will all DIE!\n");
+	fprintf(stdout,"Current amount of children: %d\n",totalNumAllowed);
+	fprintf(stdout,"Optional arguments:\n");
+	fprintf(stdout,"	-s (num)     sets the total number of processes (including parent)\n");
+	fprintf(stdout,"This programs handles signals from ctrl-c\n");
+	fprintf(stdout,"Memory Map shows current memory:\n");
+	fprintf(stdout,"	\033[22;31m0\033[0m = Frame Not in Memory\n");
+	fprintf(stdout,"	1 = Frame In Memory\n");
+	fprintf(stdout,"	\033[22;34m1\033[0m = Frame Marked for Replacement\n");
+	fprintf(stdout,"	\033[22;31mDid\033[0m this \"Cuz \033[22;34mMurica\033[0m\033[22;31m!\033[0m\n");
+	fprintf(stdout,"\n");
+	fprintf(stdout,"******** It may \"stall\", just give it a second.  It does run! *******\n");
+	fprintf(stdout,"PRESS ANY KEY TO CONTINUE\n");
+	getchar();
+}
+
+//Create & Attach to Shared Memory: shared memory segment specified by shmidVal to the address space
+if((shmidVal = shmget(key, sizeof(struct PCB), IPC_CREAT | 0666)) < 0){
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("shmget");
+	exit(EXIT_FAILURE);
+}
+if((processBlock = (struct PCB*)shmat(shmidVal, 0, 0)) == (void *)-1){ //Returns void*
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("shmat");
+	exit(EXIT_FAILURE);
+}
+if((shmidVal2 = shmget(key2, sizeof(struct timing), IPC_CREAT | 0666)) < 0){
+	fprintf(stderr,"%s %d ",__FILE__, __LINE__);
+	perror("shmget");
+	exit(EXIT_FAILURE);
+}
+if((timer = (struct timing*)shmat(shmidVal2, 0, 0)) == (void *)-1){ //Returns void*
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("shmat");
+	exit(EXIT_FAILURE);
+}
+if((shmidVal3 = shmget(key3, sizeof(struct pageTable), IPC_CREAT | 0666)) < 0){
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("shmget");
+	exit(EXIT_FAILURE);
+}
+if((PT = (struct pageTable*)shmat(shmidVal3, 0, 0)) == (void *)-1){ //Returns void*
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("shmat");
+	exit(EXIT_FAILURE);
+}
+
+//Create Semaphores
+if((semId = semget(semKey,1,IPC_CREAT | 0666)) == -1){//For advancing clock
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror(" semget");
+	exit(EXIT_FAILURE);
+}
+semctl(semId, 0, SETVAL, 1);//Initialize binary semaphore for clock, unlocked from start
+if((semIdCond = semget(semKeyCond,1,IPC_CREAT | 0666)) == -1){//For processes requesting resources
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror(" semget");
+	exit(EXIT_FAILURE);
+}
+semctl(semIdCond, 0, SETVAL, 1);//Initialize binary semaphore for requests, unlocked from start
+if((semIdR = semget(semKeyR,1,IPC_CREAT | 0666)) == -1){//For removing resources in process.c
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror(" semget");
+	exit(EXIT_FAILURE);
+}
+semctl(semIdR, 0, SETVAL, 1);//Initialize binary semaphore
+if((semIdReq = semget(semKeyReq,1,IPC_CREAT | 0666)) == -1){
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror(" semget");
+	exit(EXIT_FAILURE);
+}
+semctl(semIdReq, 0, SETVAL, 1);//Initialize binary semaphore
+
+for(p = 0; p < 18; p++){
+	processBlock->pid[p] = -1;
+	processBlock->memoryAccessCount[p] = 0;
+	processBlock->processSignal[p] = -1;
+	PT->PTLR[p] = -1;//Page Table Length Register
+	PT->suspended[p] = -1;
+	PT->baseReg[p] = -1;
+	for(r = 0; r < 32; r++){
+		PT->frameID[p][r] = -1;
+		PT->referenced[p][r] = 0;
+	}
+}
+PT->suspTail = -1;
+for(r = 0; r < 256; r++){
+	PT->dirty[r] = 0;//If page modified or not
+	PT->valid[r] = 0;//If page in memory or not
+}
+
+//Initialize clock items
+timer->clockSecs = 0;  timer->clockNanos = 0;
+
+processBlock->processDone = -1;//Hold Id of process ending
+processBlock->processSignaling = -1;//Hold Id of process requesting
+processBlock->readWriteDone = -1;//Hold Id of process done with a read/write
+
+randTime = genRandomDouble();//Timing for when to generate next process
+timePassed = getTotalTime(&timer->clockSecs, &timer->clockNanos, &timePassed);//For timing printing memory map
+daemonTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &daemonTime);//For timing printing memory map
+
+int t = 0;
+totalNumAllowed = 7;//Number of processes allowing to be created
+runTime = 3;
+
+while(true){
+		
+	// if(((totalTime - prevTotalTime) > randTime) && processCounter < 6  && resources && processId < HARD_LIMIT){
+	if(processId < 2){
+		prevTotalTime = totalTime;//Set so we can use to determine when next process can be created
+		totalTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &totalTime);
+		/***************************************************************************************************************
+		OPTIONAL: Set PTLR (below) of all processes to be 32 and uncomment line  to see Daemon in action
+		***************************************************************************************************************/
+		// PT->PTLR[processId] = rand() % 32 + 1;
+		PT->PTLR[processId] = 32;
+		// PT->PTLR[processId] = 16;
+		
+		
+		// nextIndex = getIndex(RAM, PT->PTLR[processId]);//int getIndex(int bv2[], int framesNeed)
+		nextIndex = getIndex(RAM, PT->PTLR[processId], PT, processId);//int getIndex(int bv2[], int framesNeed)
+		fprintf(stdout,"%d Index returned: %d for %d Frames\n", processId, nextIndex, PT->PTLR[processId]);
+		printBit(RAM, 32, PT->valid);
+		// return 0;
+		// if(processId != 0 && (PT->baseReg[processId - 1] + PT->PTLR[processId - 1] + PT->PTLR[processId]) > 256){//If not enough Frames available
+		if(nextIndex == -1){//If not enough Frames available
+			fprintf(stderr,"*** Tried to fork a new process: %d, Out of RAM ***\n", processId);
+			resources = false;
+			continue;
+		}
+		
+		if(bvFull(bv, totalNumAllowed) == 1){//Make sure bitVector/Process table not full. If is, don't generate new process
+			fprintf(stdout,"BV full.\n", processId);
+			resources = false;
+			continue;//If full, don't create newe process
+		}
+		if(member(bv, processId) == 0){//Insert process into bitVector.  Stop creating processes once bitVector full
+			set(bv, processId);//Put in bitvector
+		}else{
+			fprintf(stdout,"Couldn't insert %d in Process Table.\n", processId);
+		}
+		
+		//Put in Page Table
+		// if(processId != 0){
+			// nextIndex = PT->baseReg[processId - 1] + PT->PTLR[processId - 1];
+		// }else{
+			// nextIndex = 0;
+		// }
+		//Start out with at least 1 frame so can start running
+		PT->frameID[processId][r] = nextIndex;//Process #, page #, holds frame #
+		PT->baseReg[processId] = nextIndex;
+		
+		if((procPid = fork()) == 0){//is child, new process receives a copy of the address space of the parent
+			fprintf(stdout,"New child %d is %d, time: %.9f\n",processId, getpid(),prevTotalTime);
+			// fprintf(stdout,"New child %d is %d, time: %.9f, baseReg = %d, PTLR = %d, Ends at %d\n",processId, getpid(),prevTotalTime, PT->baseReg[processId], PT->PTLR[processId], PT->baseReg[processId] + PT->PTLR[processId]);
+			processBlock->running[processId] = 1;
+			processBlock->pid[processId] = getpid();
+			processBlock->cpuTimeUsed[processId] = 0;//total CPU time used
+			processBlock->totalSystemTime[processId] = totalTime;//total CPU time used
+			processBlock->turnAround[processId] = 0;
+			processBlock->idle[processId] = 0;
+			processBlock->idleTotal[processId] = 0;
+			
+			sprintf(tempProcessId,"%d", processId);//For passing the ID through exec 
+			sprintf(tempShmidVal,"%d", shmidVal);//For passing the shared mem ID through exec 
+			sprintf(tempShmidVal2,"%d", shmidVal2);//For passing the shared mem ID through exec 
+			sprintf(tempShmidVal3,"%d", shmidVal3);//For passing the shared mem ID through exec 
+ 
+			execl("./process",tempProcessId,tempShmidVal,tempShmidVal2,tempShmidVal3,NULL);//Execute executible
+			perror("Child failed to execl ");
+			exit(EXIT_FAILURE);
+		}else if(procPid < 0){//fork() fails with -1
+			fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+			perror("fork() error");
+			exit(EXIT_FAILURE);
+		}
+		randTime = genRandomDouble();//Create new random time to wait before making new process
+		processId++;
+		processCounter++;
+	}
+	if(totalTime - timePassed > 0.5){
+		fprintf(stdout,"Printing Memory Map: Time left: %.9f\n", (double)runTime - totalTime);
+		printBit(RAM, 32, PT->valid);
+		timePassed = getTotalTime(&timer->clockSecs, &timer->clockNanos, &timePassed);
+	}
+
+	if(processBlock->processDone != -1){//A process is done, remove from bitVector
+		// fprintf(stdout,"Process %d Starting to be removed by OSS\n", processBlock->processDone);
+		numberCompleted++;
+		processBlock->running[processBlock->processDone] = 0;
+		if(inQueue(PT->suspended, processBlock->processDone)){//If process suspended in a queue, remove it
+			id = selectFromQueue(PT->suspended, &PT->suspTail, processBlock->processDone);
+		}
+		for(r = 0; r < PT->PTLR[processBlock->processDone]; r++){//Remove from memory
+			if(PT->frameID[processBlock->processDone][r] != -1){
+				clearBit(RAM, PT->frameID[processBlock->processDone][r]);
+			}
+		}
+		waitingPid = waitpid(processBlock->pid[processBlock->processDone], &status, WUNTRACED);
+		if(waitingPid == -1){//Wait for this process to end before decr processCounter and creating new process
+			fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+			perror("waitpid");
+			exit(EXIT_FAILURE);
+		}
+
+		FILE *fp;
+		if((fp = fopen("log.txt","a")) == NULL){
+			fprintf(stderr,"%s",__FILE__);
+			perror("Failed to open file ");
+			return -1;//Failed
+		}
+
+		writeString[100];
+		totalTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &totalTime);
+		snprintf(writeString, sizeof(writeString),"%d terminated at time %.9f",processBlock->processDone, totalTime);
+		// snprintf(writeString, sizeof(writeString),"%d terminated at time %.9f",processBlock->processDone, totalTime);
+		
+		/**Also put EAT (Effective Access Time) in file.  Edit line #'s in Readme when done
+		Use each processes page hit ratio.  So need to log number of page faults for each process.
+		**/
+		
+		
+		writeString[strlen(writeString)-1]= '\0';//Remove \n from asctime function
+		fprintf(fp,"%s\n",writeString);
+		fclose(fp);
+		processBlock->pid[processBlock->processDone] = -1;
+		fprintf(stdout,"Process %d terminating...  Clear %d from Proccess table: \n", processBlock->processDone, processBlock->processDone);
+		clearBit(bv, processBlock->processDone);//Remove from Process Table
+		printBit(bv, 4, PT->valid);
+		processCounter--;
+		processBlock->processDone = -1;//Wait til next process done
+		signalRemove();
+	}
+	
+	if(totalTime - timePassed > 0.5){
+		fprintf(stdout,"Printing Memory Map: Time left: %.9f\n", (double)runTime - totalTime);
+		printBit(RAM, 32, PT->valid);
+		timePassed = getTotalTime(&timer->clockSecs, &timer->clockNanos, &timePassed);
+	}
+	
+	if(processBlock->processSignaling != -1){//If processes in blocked queue waiting for resources
+		signaling = processBlock->processSignaling;
+		fprintf(stdout,"OSS: signaling %d = %d\n", signaling, processBlock->processSignal[signaling]);
+		freeFrames = countEmptyFrames(RAM, 32);
+		if(freeFrames < 25 && totalTime - daemonTime > 0.001){//Free frames < 10% total frames. 256/10 = 26
+			runDaemon(freeFrames, PT, RAM);
+			printBit(RAM, 32, PT->valid);
+			daemonTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &daemonTime);//For timing printing memory map
+		}
+		pageReturned = get_page(signaling, PT, processBlock, RAM, timer);
+		if(pageReturned != -1){//Not a Page Fault
+			processBlock->processSignal[signaling] = -1;
+			processBlock->pageWant[signaling] = -1;
+			totalTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &totalTime);
+			PT->referenced[signaling][pageReturned] = totalTime;
+		}else{//Page Fault
+			processBlock->processSignal[signaling] = -1;
+			processBlock->idle[signaling] = getTotalTime(&timer->clockSecs, &timer->clockNanos, &totalTime);
+		}
+		/********************************************************************************************************************
+		OPTIONAL: Print Memory Map on every memory reference.  Uncomment function below. Try it at least once, great feedback
+		********************************************************************************************************************/
+		printBit(RAM, 32, PT->valid);
+		fprintf(stdout,"OSS DONE signaling: %d, memoryAccesses %d\n", signaling, processBlock->memoryAccessCount[signaling]);
+		
+		processBlock->processSignaling = -1;
+		signaling = -1;
+	}
+	
+	if(totalTime - timePassed > 0.5){
+		fprintf(stdout,"Printing Memory Map: Time left: %.9f\n", (double)runTime - totalTime);
+		printBit(RAM, 32, PT->valid);
+		timePassed = getTotalTime(&timer->clockSecs, &timer->clockNanos, &timePassed);
+	}
+	
+	//Check if ALL suspended.  ProcessId holds current total num processes in system, starts @@ 0
+	totalSuspended = countArray(PT->suspended);
+	if(totalSuspended == processId + 1 - numberCompleted && totalSuspended != 0){
+		advanceClock(&timer->clockSecs, &timer->clockNanos, 15000000);//advance clock 15ms
+		processRemoved = popQueue(PT->suspended, &PT->suspTail);
+		PT->valid[PT->frameID[processRemoved][processBlock->pageWant[processRemoved]]] = 1;
+		
+		if(processBlock->action[processRemoved] == 1){//0 = read, 1 = write
+			PT->dirty[PT->frameID[processRemoved][processBlock->pageWant[processRemoved]]] = 1;//If page modified or not
+		}
+		/************************************************************************************************************
+		If it helps, the function directly below prints the page table of a process once it's page fault is serviced
+		*************************************************************************************************************/
+		processBlock->pageWant[processRemoved] = -1;
+		processBlock->running[processRemoved] = 1;
+	}
+	
+	if(totalTime - timePassed > 0.5){
+		fprintf(stdout,"Printing Memory Map: Time left: %.9f\n", (double)runTime - totalTime);
+		printBit(RAM, 32, PT->valid);
+		timePassed = getTotalTime(&timer->clockSecs, &timer->clockNanos, &timePassed);
+	}
+	
+	if(processBlock->readWriteDone != -1){
+		fprintf(stdout,"OSS %d readWriteDone = %d\n", processBlock->readWriteDone, processBlock->action[processBlock->readWriteDone]);
+		processRemoved = selectFromQueue(PT->suspended, &PT->suspTail, processBlock->readWriteDone);
+		if(processRemoved != -1){//-1 if was removed previously, because all processes were suspended
+			if(processBlock->action[processRemoved] == 1){//0 = read, 1 = write
+				PT->dirty[PT->frameID[processRemoved][processBlock->pageWant[processRemoved]]] = 1;//If page modified or not
+			}
+			totalTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &totalTime);
+			processBlock->idleTotal[processRemoved] = processBlock->idleTotal[processRemoved] + totalTime - processBlock->idle[processRemoved];
+			PT->valid[PT->frameID[processRemoved][processBlock->pageWant[processRemoved]]] = 1;
+			processBlock->pageWant[processRemoved] = -1;
+			processBlock->running[processRemoved] = 1;
+			processBlock->readWriteDone = -1;
+			/************************************************************************************************************
+			If it helps, the function directly below prints the page table of a process once it's page fault is serviced
+			*************************************************************************************************************/
+			printPageTable(PT, processRemoved);//Print out this Process' Page Table since request Fulfilled
+			signalRequest();
+		}
+	}
+	
+	advanceClock(&timer->clockSecs, &timer->clockNanos, 999);//advance clock to simulate overhead
+	totalTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &totalTime);
+	
+	if(totalTime - timePassed > 0.5){//Print Memory Map every second
+		fprintf(stdout,"Printing Memory Map: Time left: %.9f\n", (double)runTime - totalTime);
+		printBit(RAM, 32, PT->valid);
+		timePassed = getTotalTime(&timer->clockSecs, &timer->clockNanos, &timePassed);
+	}
+	t++;
+	if(t > 500000){//So get some feedback if all processes done and oss time not up
+		fprintf(stdout,"OSS Running...\n");
+		t = 0;
+	}
+
+	if(totalTime > runTime && bvEmpty(bv, numberCompleted)){
+		fprintf(stdout,"Time is up!\n");
+		break;
+	}
+}
+sleep(1);
+for(p = 0; p < 18; p++){
+	memoryAccesses = memoryAccesses + processBlock->memoryAccessCount[p];
+}
+for(p = 0; p < 18; p++){
+	pageFaults = pageFaults + processBlock->pageFaults[p];
+}
+
+/************************************************************************************************************
+Statistics: Average CPU time, Average turnaround time, Average waiting time, Average Idle times for processes
+*************************************************************************************************************/
+
+numProc = processId;
+
+fprintf(stdout,"\n***************************** CPU Utilization Times ********************************\n");
+fprintf(stdout,"Total CPU Time	  Idle Time    CPU Time Used	 Cummulative CPU Time Used\n");
+for(p = 0; p < 18; p++){
+	if(processBlock->cpuTimeUsed[p] == 0){
+		numProc = p;
+		break;
+	}
+	if(processBlock->idleTotal[p] > 0){
+		fprintf(stdout,"%d: %.9f - %.9f = %.9f	  ",p,processBlock->cpuTimeUsed[p] + processBlock->idleTotal[p], processBlock->idleTotal[p], processBlock->cpuTimeUsed[p]);
+	}else{
+		fprintf(stdout,"%d: %.9f			    		  ",p,processBlock->cpuTimeUsed[p]);
+	}
+	total += processBlock->cpuTimeUsed[p];//Idle time already subtracted for cpuTimeUsed
+	fprintf(stdout,"total: %.9f\n",total);
+}
+fprintf(stdout,"\nCummulative CPU Time Used between All processes: %.9f\n",total);
+fprintf(stdout,"Average CPU Time Used: %.9f/%d = %.9f\n", total, numProc, (total/(double)numProc));
+fprintf(stdout,"CPU ran for: %.9fs\n",totalTime);
+/************************************************************************************************************
+CPU idle time left out.  Unlike a previous assignment, a process or oss will always be running since all are 
+running concurrently.  We aren't waiting for processes/oss to finish before oss/another process can run, so 
+the CPU is always running.
+*************************************************************************************************************/
+fprintf(stdout,"\n***************************** Idle Times **********************************\n");
+total = 0;
+for(p = 0; p < numProc; p++){
+	if(processBlock->idleTotal[p] > 0){
+		fprintf(stdout,"%d: %.9f	  ", p, processBlock->idleTotal[p]);
+		total = total + processBlock->idleTotal[p];
+	}
+}
+// if(total > 0){
+	fprintf(stdout,"\nAverage idle time: %.9f/%d = %.9f\n", total, numProc, total/(double)numProc);
+// }else{
+	// fprintf(stdout,"No processes were Blocked during this execution\n");
+// }
+
+fprintf(stdout,"\n***************************** Turnaround Times **********************************\n");
+total = 0;
+for(p = 0; p < numProc; p++){
+	fprintf(stdout,"%d: %.9f	  ", p, processBlock->turnAround[p]);
+	total = total + processBlock->turnAround[p];
+	if(p % 3 == 0){
+		fprintf(stdout,"\n");
+	}
+}
+fprintf(stdout,"\nAverage turnaround time: %.9f/%d = %.9f\n", total, numProc, total/(double)numProc);
+
+fprintf(stdout,"\n***************************** Waiting Times ********************************\n");
+total = 0;
+//Waiting time of a process = finish time of that process - execution time - arrival time = turnAround - CPU time used
+for(p = 0; p < numProc; p++){//Waiting time = endTime - creation time - turnaround
+	fprintf(stdout,"%d: %.9f	  ",p,processBlock->totalSystemTime[p] - processBlock->turnAround[p]);
+	total = total + processBlock->totalSystemTime[p] - processBlock->turnAround[p];
+	if(p % 3 == 0){
+		fprintf(stdout,"\n");
+	}
+}
+fprintf(stdout,"\nAverage Waiting time: %.9f/%d = %.9f\n",total, numProc, total/(double)numProc);
+/************************************************************************************************************
+No scheduling in this project, so waiting time is relatively short since upon creation, the process will
+arrive in a short period of time and start executing immediately
+*************************************************************************************************************/
+fprintf(stdout,"\n***************************** Throughput ********************************\n");
+fprintf(stdout,"Number of Processes Completed = %d, Total Time %.9f\n", numProc, totalTime);
+fprintf(stdout,"Throughput: %d/%.9f = %.9f\n",numProc, totalTime, totalTime/(double)numProc);
+fprintf(stdout,"A process is created at a rate approximately every %.9fs\n", totalTime/(double)numProc);
+
+fprintf(stdout,"\n***************************** Memory Access ********************************\n");
+fprintf(stdout,"Page Faults: %d\n",pageFaults);
+fprintf(stdout,"Memory Accesses: %d\n",memoryAccesses);
+fprintf(stdout,"Page Fault Rate: %d/%d = %.9f\n", pageFaults, memoryAccesses, (double)pageFaults/(double)memoryAccesses);
+fprintf(stdout,"\n");
+for(p = 0; p < 18; p++){
+	if(PT->baseReg[p] != -1){
+		fprintf(stdout,"%d's Frames = [%d-%d],  ", p, PT->baseReg[p], PT->baseReg[p] + PT->PTLR[p] - 1);
+	}
+	if(p % 5 == 0){
+		fprintf(stdout,"\n");
+	}
+}
+fprintf(stdout,"\n");
+// for(p = 0; p < 18; p++){
+	// if(PT->baseReg[p] != -1){
+		// fprintf(stdout,"baseReg[%d] = %d, ", p, PT->baseReg[p]);
+	// }
+// }
+// fprintf(stdout,"\n\n");
+// for(p = 0; p < 18; p++){
+	// if(PT->PTLR[p] != -1){
+		// fprintf(stdout,"PTLR[%d] = %d, ", p, PT->PTLR[p]);
+	// }
+// }
+// fprintf(stdout,"\n");
+
+// printBit(RAM, 32);
+for(p = 0; p < 18; p++){
+	for(r = 0; r < 32; r++){
+		if(PT->frameID[p][r] != -1){
+			clearBit(RAM, PT->frameID[p][r]);
+		}
+	}
+}
+
+if(procPid != 0){//child's pid returned to parent
+	// printf("Master ID %d\n",getpid());
+   bool childrenAlive = false;
+   for(p = 0; p < 18; p++){
+		if(processBlock->pid[p] != -1){//If > 0 processes running, not deadlocked
+			fprintf(stdout,"********************** processBlock->pid[%d] = %d ********************************\n", p, processBlock->pid[p]);
+			childrenAlive = true;
+			break;
+		}
+	}
+
+   if(childrenAlive){//If processes still alive, kill them
+		fprintf(stdout,"Time is up, but children remain and must be eradicated...\n");
+		fprintf(stdout,"     _.--''--._\n");
+		fprintf(stdout,"    /  _    _  \\ \n");
+		fprintf(stdout," _  ( (_\\  /_) )  _\n");
+		fprintf(stdout,"{ \\._\\   /\\   /_./ }\n");
+		fprintf(stdout,"/_'=-.}______{.-='_\\ \n");
+		fprintf(stdout," _  _.=('''')=._  _\n");
+		fprintf(stdout,"(_''_.-'`~~`'-._''_)\n");
+		fprintf(stdout," {_'            '_}\n");
+		fprintf(stderr,"\n");
+
+		kill(-getpid(),SIGINT);
+	}
+}
+
+//Detach from shared mem and Remove shared mem when all processes done
+if(shmdt(processBlock) == -1){
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+        perror("shmdt");
+        exit(EXIT_FAILURE);
+}
+if (shmctl(shmidVal,IPC_RMID,NULL) == -1){
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("shmctl");
+	exit(EXIT_FAILURE);
+}
+if(shmdt(timer) == -1){
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+        perror("shmdt");
+        exit(EXIT_FAILURE);
+}
+if (shmctl(shmidVal2,IPC_RMID,NULL) == -1){
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("shmctl");
+	exit(EXIT_FAILURE);
+}
+if(shmdt(PT) == -1){
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("shmdt");
+	exit(EXIT_FAILURE);
+}
+if (shmctl(shmidVal3,IPC_RMID,NULL) == -1){
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("shmctl");
+	exit(EXIT_FAILURE);
+}
+
+//Delete Semaphore.  IPC_RMID Remove the specified semaphore set
+if(semctl(semId, 0, IPC_RMID) == -1){//For clock
+    fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("semctl");
+	exit(EXIT_FAILURE);
+}
+if(semctl(semIdCond, 0, IPC_RMID) == -1){//For processes requesting resources
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("semctl");
+	exit(EXIT_FAILURE);
+}
+if(semctl(semIdR, 0, IPC_RMID) == -1){//For clock
+    fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("semctl");
+	exit(EXIT_FAILURE);
+}
+if(semctl(semIdReq, 0, IPC_RMID) == -1){
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("semctl");
+	exit(EXIT_FAILURE);
+}
+
+fprintf(stdout,"Master process is complete\n");
+return 0;
+}//END main
+
+char indexToAlpha(int index){
+   char c= (char)( (int)('a')+ index);
+   return c;
+}
+
+void sigHandler(int mysignal){
+	// printf("MASTER process id %d  signal %d\n", getpid(),mysignal);
+	struct PCB *processBlock;
+	struct timing *timer;
+	struct pageTable *PT;
+	
+	//Attach to shared memory
+	if((processBlock = (struct PCB *)shmat(shmidVal, (void *)0, 0)) == (void *)-1){ //Returns void*
+		fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+		perror("shmat");
+		exit(EXIT_FAILURE);
+	}
+	if((timer = (struct timing *)shmat(shmidVal2, 0, 0)) == (void *)-1){ //Returns void*
+		fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+		perror("shmat");
+		exit(EXIT_FAILURE);
+	}
+	if((PT = (struct pageTable *)shmat(shmidVal3, 0, 0)) == (void *)-1){ //Returns void*
+		fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+		perror("shmat");
+		exit(EXIT_FAILURE);
+	}
+
+	switch(mysignal){
+		case SIGINT:
+			fprintf(stderr,"The Parent killed all of the children because something interrupted it (probably the children)!\n");
+			// kill(-getpid(),SIGTERM);
+			//Detach & Remove shared mem when all processes done
+			if(shmdt(processBlock) == -1){
+				fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+			    perror("shmdt");
+ 			    exit(EXIT_FAILURE);
+			}
+			if (shmctl(shmidVal,IPC_RMID,NULL) == -1){
+				fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+				perror("shmctl");
+				exit(EXIT_FAILURE);
+			}
+			if(shmdt(timer) == -1){
+				fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+			        perror("shmdt");
+ 			       exit(EXIT_FAILURE);
+			}
+			if (shmctl(shmidVal2,IPC_RMID,NULL) == -1){
+				fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+				perror("shmctl");
+				exit(EXIT_FAILURE);
+			}
+			if(shmdt(PT) == -1){
+				fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+			        perror("shmdt");
+ 			       exit(EXIT_FAILURE);
+			}
+			if (shmctl(shmidVal3,IPC_RMID,NULL) == -1){
+				fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+				perror("shmctl");
+				exit(EXIT_FAILURE);
+			}
+			
+			//Delete Semaphore.  IPC_RMID Remove the specified semaphore set
+			if(semctl(semId, 0, IPC_RMID) == -1){
+				fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+				perror("semctl");
+				exit(EXIT_FAILURE);
+			}
+			if(semctl(semIdCond, 0, IPC_RMID) == -1){
+				fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+				perror("semctl");
+				exit(EXIT_FAILURE);
+			}
+			if(semctl(semIdR, 0, IPC_RMID) == -1){//For clock
+				fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+				perror("semctl");
+				exit(EXIT_FAILURE);
+			}
+			if(semctl(semIdReq, 0, IPC_RMID) == -1){
+				fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+				perror("semctl");
+				exit(EXIT_FAILURE);
+			}
+
+			exit(1);
+			break;
+		default:
+			printf("Default signal %d\n", mysignal);
+			break;
+	}
+	return;
+}
+
+void initSigHandler(){
+	struct sigaction signalAct;
+	signalAct.sa_handler = &sigHandler;//Setup sigHandler
+	signalAct.sa_flags = SA_RESTART|SA_SIGINFO;
+	// sigfillset(&signalAct.sa_mask);//Block all other signals
+
+	if(sigaction(SIGINT, &signalAct, NULL) == -1){
+		perror("SIGINT receipt failed");
+	}
+}
+
+int get_page(int processId, struct pageTable* PT, struct PCB* processBlock, int RAM[], struct timing* timer){
+	// fprintf(stdout,"get_page process %d wants page %d = frame %d\n", processId, processBlock->pageWant[processId], PT->frameID[processId][processBlock->pageWant[processId]]);
+	int p;
+	int frameWant = PT->baseReg[processId] + processBlock->pageWant[processId];;
+	// if(processBlock->pageWant[processId] > PT->PTLR[processId] - 1){
+	if(frameWant > PT->baseReg[processId] + PT->PTLR[processId] - 1){
+		perror("Accessing outside memory: Segmentation Fault\n");
+		exit(0);
+	}
+	// fprintf(stdout,"get_page process %d wants page %d = frame %d\n", processId, processBlock->pageWant[processId], frameWant);
+	processBlock->memoryAccessCount[processId] = processBlock->memoryAccessCount[processId] + 1;
+	
+	if(member(RAM, frameWant) == 0){//Check if frame not in memory
+	// if(PT->valid[frameWant] == 0){//Check if frame not in memory
+		// fprintf(stdout,"%d Page Faulted on Page %d = frame %d\n", processId, processBlock->pageWant[processId], frameWant);
+		set(RAM, frameWant);//Put frame in memory
+		PT->frameID[processId][processBlock->pageWant[processId]] = frameWant;//Put Frame Id in Page Table
+		PT->valid[frameWant] = 1;
+		processBlock->running[processId] = 0;//Suspended now
+		addQueue(processId, PT->suspended, &PT->suspTail);//Now in Suspended Queue
+		processBlock->pageFaults[processId] = processBlock->pageFaults[processId] + 1;
+		return -1;
+	}else{//Frame IS in memory
+		// fprintf(stdout,"Frame %d available for: %d\n", frameWant, processId);
+		PT->valid[frameWant] = 1;
+		if(processBlock->action[processId] == 1){
+			PT->dirty[frameWant] = 1;
+		}
+		processBlock->action[processId] = -1;
+		advanceClock(&timer->clockSecs, &timer->clockNanos, 10);//advance clock 10ns on success
+		signalRequest();
+		return processBlock->pageWant[processId];
+	}
+}
+
+void runDaemon(int freeFrames, struct pageTable* PT, int RAM[]){
+	// fprintf(stdout,"RUNNING DAEMON\n");
+	int tempId = -1;
+	int tempPage = -1;
+	int numTurnOff = 256 * 0.05;
+	int LRU[numTurnOff];//Hold all frame addresses of oldest numTurnOff residents
+	int pid[numTurnOff];//Hold pid that has the frame removing
+	int pageId[numTurnOff];//Hold page Id of frame removing
+	double times[numTurnOff];//Hold all frame addresses of oldest numTurnOff residents
+	double frameLRUTime = 9999;
+	int frameLRU = -1;
+	fprintf(stdout,"freeFrames %d numTurnOff %d\n", freeFrames, numTurnOff);
+	int f, p, r;
+	for(f = 0; f < numTurnOff; f++){
+		LRU[f] = -1;
+	}
+	
+	for(f = 0; f < numTurnOff; f++){//Find LRU Frames
+		for(p = 0; p < 18; p++){
+			// for(r = 0; r < 32; r++){
+			for(r = 0; r < PT->PTLR[p]; r++){
+				// fprintf(stdout,"PT->referenced[%d][%d] %.9f, PT->frameID[%d][%d] = %d\n", p, r, PT->referenced[p][r], p, r, PT->frameID[p][r]);
+				// if(PT->referenced[p][r] < frameLRUTime && PT->referenced[p][r] != 0){
+				// if(PT->referenced[p][r] < frameLRUTime && PT->referenced[p][r] != 0 && inQueue(LRU, PT->frameID[p][r]) == 0){
+				if(PT->referenced[p][r] < frameLRUTime && PT->referenced[p][r] > (double)0 && member(RAM, PT->frameID[p][r]) == 1 && inQueue(LRU, PT->frameID[p][r]) == 0){
+					frameLRUTime = PT->referenced[p][r];
+					frameLRU = PT->frameID[p][r];
+					tempId = p;
+					tempPage = r;
+					// fprintf(stdout,"PT->referenced[%d][%d] %.9f, PT->frameID[%d][%d] = %d, inQueue %d\n", p, r, PT->referenced[p][r], p, r, PT->frameID[p][r], inQueue(LRU, PT->frameID[p][r]));
+				}else if(PT->referenced[p][r] == 0){
+					// fprintf(stdout,"NOT EXIST: PT->referenced[%d][%d] %.9f, PT->frameID[%d][%d] = %d, inQueue %d, member %d\n", p, r, PT->referenced[p][r], p, r, PT->frameID[p][r], inQueue(LRU, PT->frameID[p][r]), member(RAM, PT->frameID[p][r]));
+				}
+			}
+		}
+		pid[f] = tempId;
+		pageId[f] = tempPage;
+		LRU[f] = frameLRU;
+		times[f] = frameLRUTime;
+		// fprintf(stdout,"tempId %d, tempPage %d, frameLRU %d, frameLRUTime %.9f\n", tempId, tempPage, frameLRU, frameLRUTime);
+		frameLRUTime = 9999;
+		frameLRU = -1;
+	}
+	
+	for(f = 0; f < numTurnOff; f++){
+		// fprintf(stdout,"LRU[%d] = %.9f   frame %d\n", f, times[f], LRU[f]);
+		if(PT->valid[LRU[f]] == 1 ){//Turn off valid bit
+			// fprintf(stdout,"Turning of valid bit frame %d, valid bit was %d\n", LRU[f], PT->valid[LRU[f]]);
+			PT->valid[LRU[f]] = 0;
+		}else if(PT->valid[LRU[f]] == 0){//Remove from memory
+			if(PT->dirty[LRU[f]] == 1){
+				/**************************************************************************
+				 Save to Disk before Removing Frame since has been wrote to (dirty bit set)
+				**************************************************************************/
+			}
+			// fprintf(stdout,"Removing frame %d == %d, is member %d, valid bit was %d, pid %d, pageId %d\n", LRU[f], PT->frameID[pid[f]][pageId[f]], member(RAM, LRU[f]), PT->valid[LRU[f]], pid[f], pageId[f]);
+			PT->dirty[LRU[f]] = 0;
+			PT->referenced[pid[f]][pageId[f]] = 0;
+			clearBit(RAM, LRU[f]);//Remove from Memory
+			// PT->frameID[pid[f]][pageId[f]] = -1;
+		}else{
+			fprintf(stdout,"ERROR frame %d, valid bit %d\n", LRU[f], PT->valid[LRU[f]]);
+		}
+	}
+	
+	return;
+}
+
+int getIndex(int bv2[], int framesNeed, struct pageTable* PT, int numProcesses){
+	
+int isset = 0; 
+int bv, index = 0;
+bv = *bv2; 
+int j, i, p;
+int emptyFrames = 0;
+
+// fprintf(stdout, "getIndex Order:\n");
+// for(p=0; p < 32; p++){
+for(i = 0; i < 256; i++){
+	// fprintf(stdout, "i:%d ", i);
+   // for(j=0;j<8;++j){//Go through each byte
+		// isset = (bv & ((int32_t) 1 << (p * 8 + j)));
+		isset = (bv & ((int32_t) 1 << (i)));
+		// fprintf(stdout, "j:%d ", j);
+		fprintf(stdout, "%d ", isset);
+		if(!isset){
+			for(p = 0; p <= numProcesses; ++p){//Go through each process alive
+				j = i + 1 - emptyFrames;
+				fprintf(stdout, "Checking Index: %d > i:%d > %d\n", (PT->baseReg[p] + PT->PTLR[p] - 1), j, PT->baseReg[p]);
+				// j = index + 1 - emptyFrames;
+				//If the Index we want to return is inside another processes allocated frames
+				if(j > PT->baseReg[p] && j < (PT->baseReg[p] + PT->PTLR[p] - 1)){
+					index++;
+					emptyFrames = 0;
+					continue;
+				}
+			}
+			emptyFrames++;
+			// fprintf(stdout, "emptyFrames %d\n", emptyFrames);
+			if(emptyFrames >= framesNeed){
+				break;
+			}
+		}else{
+			emptyFrames = 0;
+		}	
+		index++;
+	// }
+	// fprintf(stdout, "\n");
+	if(emptyFrames >= framesNeed){
+		break;
+	}
+}
+fprintf(stdout, "\n");
+fprintf(stdout, "Return Start Index: %d, emptyFrames %d, End Index %d\n", i + 1 - emptyFrames, emptyFrames, i);
+// fprintf(stdout, "Return Start Index: %d, emptyFrames %d, End Index %d\n", index + 1 - emptyFrames, emptyFrames, index);
+// fprintf(stdout, "Return Byte %d, Start Index: %d, emptyFrames %d, End Index %d\n", j, index + 1 - emptyFrames, emptyFrames, index);
+		
+if(emptyFrames >= framesNeed){
+	return i + 1 - emptyFrames;
+	// return index + 1 - emptyFrames;
+}
+return -1;//Can't fit this process into memory
+}
+
+void printPageTable(struct pageTable* PT, int processId){
+	fprintf(stdout,"\033[22;32m%d's Page Table (Base Register = %d, PTLR = %d): ", processId, PT->baseReg[processId], PT->PTLR[processId]);
+	int p;
+	for(p = 0; p < PT->PTLR[processId]; p++){
+		if(PT->frameID[processId][p] != -1){
+			fprintf(stdout,"%d ", PT->frameID[processId][p]);
+		}else{
+			fprintf(stdout,". ");
+		}
+	}
+	fprintf(stdout,"\033[0m\n");
+	return;
+}
+
+int addQueue(int processId, int suspended[18], int *tail){
+	// fprintf(stdout,"Added Process %d to suspended Queue\n", processId);
+	if(*tail == HARD_LIMIT){ // Check to see if the Queue is full
+		fprintf(stdout,"%d QUEUE IS FULL\n",processId);
+		return 0;
+	}
+	*tail = *tail + 1;
+	suspended[*tail % HARD_LIMIT] = processId;// Add the item to the Queue
+	// fprintf(stdout,"suspended[%d] = %d = %d, tail = %d \n", *tail % HARD_LIMIT, processId,suspended[*tail % HARD_LIMIT], *tail);
+	return 1;
+}
+
+void printQueue(int suspended[]){
+	fprintf(stdout,"suspended Queue: [");
+	int x;
+	for(x = 0; suspended[x] != -1; x++){
+	// for(x = 0; x < 18; x++){
+		fprintf(stdout,"%d ",suspended[x]);
+	}
+	fprintf(stdout,"]\n");
+	return;
+}
+
+int inQueue(int suspended[], int processId){
+	int i;
+	for(i = 0; suspended[i] != -1; i++){//Move elements forward in the queue
+		if(suspended[i] == processId){
+			return 1;//Process already in queue
+		}
+	}
+	return 0;//Process not in queue
+}
+
+int queueEmpty(int suspended[]){
+	int n = 0, x;
+	for(x = 0; suspended[x] != -1; x++){
+		n++;
+		return n;
+	}
+	return n;//If 0 is empty
+}
+
+int selectFromQueue(int suspended[], int *tail, int processId){
+	// fprintf(stderr,"tail: %d, processId: %d \n", *tail, processId);
+	if(*tail == -1){// Check for empty Queue
+		// fprintf(stderr,"suspended QUEUE IS EMPTY \n");
+		return -1;  // Return 0 if queue is empty
+	}else{
+		*tail = *tail - 1;
+		// fprintf(stdout,"processId Want = %d, tail = %d\n",processId, *tail);
+		int i = 0;
+		while(suspended[i] != processId){//Find element in queue
+			// fprintf(stdout,"Id search suspended[%d] = %d != %d\n",i, suspended[i], processId);
+			i++;
+		}
+		// fprintf(stdout,"Id Found suspended[%d] = %d\n",i, suspended[i]);
+		processId = suspended[i];// Get Id to return
+		suspended[i] = -1;
+		// int i = 1;
+		while(suspended[i + 1] != -1){//Move elements forward in the queue
+			// fprintf(stdout,"Shift suspended[%d] = %d\n",i , suspended[i + 1]);
+			suspended[i] = suspended[i + 1];
+			i++;
+		}
+		// fprintf(stdout,"suspended[%d] = 0\n",i);
+		suspended[i] = -1;//Set last spot that was filled to 0 since process moved up in queue
+		// fprintf(stdout,"Oss: Select queue return: %d\n",processId);
+		return processId;// Return popped Id
+	}
+}
+
+int popQueue(int theQueue[], int *tail){
+	int processId;
+	if(*tail == -1){// Check for empty Queue
+		// fprintf(stderr,"POP QUEUE IS EMPTY \n");
+		return 0;  // Return null character if queue is empty
+	}
+	*tail = *tail - 1;
+	// fprintf(stdout,"POP theQueue[0] = %d, tail = %d\n",theQueue[0],*tail);
+	processId = theQueue[0];	// Get character to return
+	int i = 1;
+	while(theQueue[i] != -1){//Move elements forward in the queue
+		// fprintf(stdout,"POP theQueue[%d] = %d\n",i - 1, theQueue[i]);
+		theQueue[i - 1] = theQueue[i];
+		i++;
+	}
+	// fprintf(stdout,"POP theQueue[%d] = 0\n",i - 1);
+	theQueue[i - 1] = -1;//Set last spot that was filled to 0 since process moved up in queue
+	return processId;// Return popped character
+}
+
+int countArray(int array[]){
+	int n = 0, x;
+	for(x = 0; x < 18; x++){
+		if(array[x] != -1){
+			n++;
+		}
+	}
+	return n;
+}
+
+void advanceClock(int *clockSecs, int *clockNanos, int amount){//1 sec = 1,000 milli = 1,000,000 micro = 1,000,000,000 nano
+	waitClock();
+	int randTime;
+	if(amount == 10){
+		randTime = amount;//incr 10 ns
+	}else if(amount == 15000000){
+		randTime = amount;//incr 15000000ns, 15ms
+	}else{
+		randTime = rand() % amount + 1;//simulate overhead activity for each iteration by 0.0001s
+	}
+	// fprintf(stdout,"ENTER clockSecs %d, clockNanos %d, randTime %d, %d += %d\n",*clockSecs,*clockNanos,randTime,*clockNanos,randTime);
+	*clockNanos += randTime;
+	if(*clockNanos > 999999999){
+		*clockSecs = *clockSecs + 1;
+		*clockNanos -= 1000000000;
+	}
+	// fprintf(stdout,"LEAVE clockSecs %d, clockNanos %d\n",*clockSecs,*clockNanos);
+	signalClock();
+	return;
+}
+
+double getTotalTime(int *clockSecs, int *clockNanos, double *time){
+	// double time = (double)*clockSecs + ((double)*clockNanos/1000000000);
+	*time = 0;
+	*time = (double)*clockSecs + ((double)*clockNanos/1000000000);
+	return *time;
+}
+
+void clearBit(int bv[], int i){//Clear the process from the process table
+  int j = i/32;
+  int pos = i%32;//2 % 32 = 2.  33 % 32 = 1.
+  unsigned int flag = 1;  // flag = 0000.....00001
+  flag = flag << pos;     // flag = 0000...010...000   (shifted i positions)
+  flag = ~flag;           // flag = 1111...101..111 - Reverse the bits
+  // fprintf(stdout,"Clear Frame %d: byte %d, pos %d, = %d \n", i, j, pos, bv[j] & flag);
+  bv[j] = bv[j] & flag;   // RESET the bit at the i-th position in bv[i]
+  //OR this is all the above consolidated: bv[i/32] &= ~(1 << (i%32));
+  return;
+}
+
+void set(int bv[], int i){//set value in bv.  i is value to set in bv array
+  int j = i/32;//Get the array index/position
+  int pos = i%32;//Get the bit position
+  unsigned int flag = 1;   // flag = 0000.....00001
+  
+  flag = flag << pos;      // flag = 0000...010...000   (shifted i positions)
+	
+  bv[j] = bv[j] | flag;    // Set the bit at the i-th position in bv[i]
+  // fprintf(stdout,"Setting Frame %d: byte %d, pos %d, = %d \n", i, j, pos, bv[j] | flag);
+  //OR this is all the above consolidated: bv[i/32] |= 1 << (i%32);
+  return;
+}
+
+void printBit(int bv[], int size, char valid[]){//set value in bv.  i is value to set in bv array
+int i = 0, p;
+int numBits = size * 8;
+if(size == 32){ // fprintf(stdout,"Printing Memory Map\n");
+	fprintf(stdout,"    \033[01;35m0 1 2 3 4 5 6 7 8 9          15  16                           31\033[0m\n");
+}else{
+	fprintf(stdout,"\033[01;35m0 1 2 3 4 5 6 7 8 9          15  16                           31\033[0m\n");
+}
+if(size == 32){
+	for(p=0; p < numBits; p++){
+		if(i == 0){
+			if(p == 0){
+				fprintf(stdout,"\033[01;35m%d   \033[0m", p);
+			}else if(p == 32 || p == 64 || p == 96){
+				fprintf(stdout,"\033[01;35m%d  \033[0m", p);
+			}else{
+				fprintf(stdout,"\033[01;35m%d \033[0m", p);
+			}
+		}
+		 if(member(bv, p)){
+			 if(valid[p] == 0){
+				fprintf(stdout, "\033[22;34m1 \033[0m");
+			 }else{
+				 fprintf(stdout, "1 ");
+			 }
+		 }else{
+			fprintf(stdout, "\033[22;31m0 \033[0m"); 
+		 }
+	
+		i++;
+		if(i == 16){
+			fprintf(stdout," ");
+		}else if(i == 32){
+			fprintf(stdout,"\033[01;35m%d \033[0m\n", p);
+			i = 0;
+		}
+	}
+}else{
+	for(p=0; p < numBits; p++){
+		 if(member(bv, p)){
+			fprintf(stdout, "1 ");
+		 }else{
+			fprintf(stdout, "\033[22;31m0 \033[0m"); 
+		 }
+		i++;
+		if(i == 16){
+			fprintf(stdout," ");
+		}else if(i == 32){
+			fprintf(stdout,"\n");
+			i = 0;
+		}
+	}
+}
+
+return;
+}
+
+int countEmptyFrames(int bv2[], int size){
+	
+// int j, p, i = 0, count = 0, size = 32;
+int j, p, i = 0, count = 0, numBits = size * 8;
+int maxPow = 1<<(size*8-1);
+// fprintf(stdout, "COUNTING FREE FRAMES\n");
+// for(p=0; p < 256; p++){
+for(p=0; p < numBits; p++){
+	if(!member(bv2, p)){
+		count++;
+		// fprintf(stdout, "%d ", member(bv2, p));
+	 }else{
+		 // fprintf(stdout, "%d ", member(bv2, p));
+	 }
+	if(p % 32 == 31){
+	 // fprintf(stdout, "\n");
+	}
+}
+// fprintf(stdout, "DONE COUNTING FREE FRAMES %d\n", count);
+return count;
+}
+
+int member(int bv[], int i){//check if i in bv
+  int j = i/32;//Get the array position
+  int pos = i%32;//Get the bit position
+  unsigned int flag = 1;  // flag = 0000.....00001
+  flag = flag << pos;     // flag = 0000...010...000   (shifted i positions)
+  int p;
+	// fprintf(stdout,"member flag: %d, number looking for: %d\n", flag, i);
+  // fprintf(stdout,"member bv[%d]: %d\n", j, bv[j]);
+  if (bv[j] & flag)// Test the bit at the k-th position in bv[i]
+	 return 1;
+  else
+	 return 0;
+ //OR this is all the above consolidated: return ((bv[i/32] & (1 << (i%32) )) != 0) ;
+}
+
+int bvFull(int bv[], int numProcesses){//check if i in bv
+	int i;
+	for(i = 0; i <= numProcesses; i++){
+		  int j = i/32;//Get the array position
+		  int pos = i%32;//Get the bit position
+		  unsigned int flag = 1;  // flag = 0000.....00001
+		  flag = flag << pos;     // flag = 0000...010...000   (shifted i positions)
+		  int p;
+		  if (bv[j] & flag){// Test the bit at the k-th position in bv[i]
+			//Spot taken
+		  }else{
+			  return 0;//Spot open
+		  }
+	}
+	return 1;//Is full
+}
+
+int bvEmpty(int bv[], int numProcesses){//check if i in bv
+	int i;
+	for(i = 1; i <= numProcesses; i++){
+		  int j = i/32;//Get the array position
+		  int pos = i%32;//Get the bit position
+		  unsigned int flag = 1;  // flag = 0000.....00001
+		  flag = flag << pos;     // flag = 0000...010...000   (shifted i positions)
+		  int p;
+		  if (bv[j] & flag){// Test the bit at the k-th position in bv[i]
+			return 0;//Not empty
+		  }else{
+		  }
+	}
+	return 1;//Is empty
+}
+
+void waitClock(){
+	operation.sem_num = 0;/* Which semaphore in the semaphore array*/
+    operation.sem_op = -1;/* Subtract 1 from semaphore value*/
+    operation.sem_flg = 0;/* Set the flag so we will wait*/
+    if(semop(semId, &operation, 1) == -1){
+        exit(EXIT_FAILURE);
+    }
+}
+
+void signalClock(){
+	operation.sem_num = 0;/* Which semaphore in the semaphore array*/
+    operation.sem_op = 1;/* Add 1 to semaphore value*/
+    operation.sem_flg = 0;/* Set the flag so we will wait*/
+	if(semop(semId, &operation, 1) == -1){
+        exit(EXIT_FAILURE);
+    }
+}
+
+void waitRemove(){
+	removeP.sem_num = 0;/* Which semaphore in the semaphore array*/
+    removeP.sem_op = -1;/* Subtract 1 from semaphore value*/
+    removeP.sem_flg = 0;/* Set the flag so we will wait*/
+    if(semop(semIdR, &removeP, 1) == -1){
+        exit(EXIT_FAILURE);
+    }
+}
+
+void signalRemove(){
+	removeP.sem_num = 0;/* Which semaphore in the semaphore array*/
+    removeP.sem_op = 1;/* Add 1 to semaphore value*/
+    removeP.sem_flg = 0;/* Set the flag so we will wait*/
+	if(semop(semIdR, &removeP, 1) == -1){
+        exit(EXIT_FAILURE);
+    }
+}
+
+void signalRequest(){
+	request.sem_num = 0;/* Which semaphore in the semaphore array*/
+	request.sem_op = 1;/* Add 1 to semaphore value*/
+	request.sem_flg = 0;/* Set the flag so we will wait*/
+	if(semop(semIdReq, &request, 1) == -1){
+		exit(EXIT_FAILURE);
+	}
+}
+
+double genRandomDouble(){
+	// fprintf(stdout,"returning %.9f\n", ((double)rand() * ( 0.5 - 0 ) ) / (double)RAND_MAX + 0);
+	// return ((double)rand() * (max - min)) / (double)RAND_MAX + min;
+	return ((double)rand() * ( 0.5 - 0 ) ) / (double)RAND_MAX + 0;//[0-500ms]
+}
+
+/*$Author: o2-gray $
+*$Date: 2016/04/24 03:16:06 $
+*$Log: oss.c,v $
+*Revision 1.4  2016/04/24 03:16:06  o2-gray
+*About done.  Need more testing with multiple processes and then do statistics
+*
+*Revision 1.3  2016/04/23 21:14:26  o2-gray
+*This is a late check-in.  Worked on it all yesterday and didn't remember to
+*check it in until I layed down.  Set an alarm to do it today and got distracted.
+*Anyways...
+*getPage is working good with multiple processes now.  Had to change a few things
+*around since not testing it so much now.  Started to create the Daemon function.
+*
+*Revision 1.2  2016/04/20 03:18:00  o2-gray
+*RAM, Process Table, Suspended Queue, Page Tables, PCBs, and timing all set up
+*Doing memory request with 1 process right now.  Need to finish get_page then
+*test with more processes.
+*
+*Revision 1.1  2016/04/17 02:37:48  o2-gray
+*Initial revision
+*
+*/
+@
+
+
+1.4
+log
+@About done.  Need more testing with multiple processes and then do statistics
+@
+text
+@a18 1
+int numAllowedConcurrently = 5;//Number of processes allowed to run at the same time
+d20 2
+a21 1
+
+d98 1
+d164 1
+a189 1
+fprintf(stdout,"Number processes Running: %d\n", totalNumAllowed);
+d191 1
+a191 1
+totalNumAllowed = 1;//Number of processes allowing to be created
+d196 2
+a197 2
+	// if(((totalTime - prevTotalTime) > randTime) && processId < totalNumAllowed){
+	if(processId < totalNumAllowed && resources){
+d200 19
+a226 1
+			// fprintf(stdout,"Bit %d set.\n", processId);
+d232 5
+a236 23
+		// PT->PTLR[processId] = rand() % 32 + 1;
+		PT->PTLR[processId] = 32;
+		
+		taken = 0;//Number of frames taken
+		for(r = 0; r < processCounter + 1; r++){
+			taken = taken + PT->PTLR[r - 1];
+			// fprintf(stdout,"taken = %d, freeFrames = %d, PT->PTLR[%d]\n", taken, freeFrames, r);
+		}
+	
+		freeFrames = countEmptyFrames(RAM, 32);
+		if(freeFrames - taken < PT->PTLR[processId]){//If not enough Frames available
+			fprintf(stdout,"*** Tried to fork a new process %d, Out of RAM ***\n", processId);
+			resources = false;
+			fprintf(stdout,"PRESS ANY KEY TO CONTINUE\n");
+			getchar();
+			continue;
+		}
+		
+		if(processId != 0){
+			nextIndex = PT->baseReg[processId - 1] + PT->PTLR[processId - 1];
+		}else{
+			nextIndex = 0;
+		}
+d242 2
+a243 2
+			// fprintf(stdout,"New child %d is %d, time: %.9f\n",processId, getpid(),prevTotalTime);
+			fprintf(stdout,"New child %d is %d, time: %.9f, baseReg = %d, PTLR = %d, Ends at %d\n",processId, getpid(),prevTotalTime, PT->baseReg[processId], PT->PTLR[processId], PT->baseReg[processId] + PT->PTLR[processId]);
+d267 6
+d276 1
+a276 1
+		fprintf(stdout,"Process %d Starting to be removed by OSS\n", processBlock->processDone);
+a280 1
+			// fprintf(stdout,"Process %d Removed from %d Queue\n", id, r);
+a281 2
+		// fprintf(stdout,"Clear %d from Proccess table: ", processBlock->processDone);
+		// clearBit(bv, processBlock->processDone);//Remove from Process Table
+a287 1
+		// fprintf(stdout,"WAITING ON Process %d - %d\n", processBlock->processDone, waitingPid);
+d304 7
+a310 1
+		/**Also put EAT (Effective Access Time) in file**/
+d318 1
+d323 6
+a328 1
+	// processRequestId = processBlock->processRequesting;
+a329 1
+		// fprintf(stdout,"OSS %d signaling\n", processBlock->processSignaling);
+d331 1
+a337 2
+		// PT->reqTime[signaling] = getTotalTime(&timer->clockSecs, &timer->clockNanos, &PT->reqTime[signaling]);
+		// get_page(signaling, PT, processBlock, RAM, timer);
+d339 2
+a340 1
+		if(pageReturned != -1){
+d344 11
+a354 2
+		}
+		// fprintf(stdout,"OSS DONE signaling: %d, memoryAccesses %d\n", signaling, processBlock->memoryAccessCount[signaling]);
+d356 6
+a361 1
+		processBlock->processSignaling = -1;
+a366 1
+		fprintf(stdout,"ALL PROCESSES SUSPENDED %d == %d\n", totalSuspended, processId);
+a367 1
+		// printQueue(PT->suspended);
+a368 1
+		// fprintf(stdout,"%d POPPED from queue\n", processRemoved);
+d374 3
+a376 2
+	
+		printPageTable(PT, processRemoved);//Print out this Process' Page Table since request Fulfilled
+d379 6
+a384 1
+		// fprintf(stdout,"%d RUNNING after POPPED\n", processRemoved);
+d388 1
+a388 1
+		// fprintf(stdout,"OSS %d readWriteDone = %d\n", processBlock->readWriteDone, processBlock->action[processBlock->readWriteDone]);
+d390 1
+a390 3
+		if(processRemoved != -1){//-1 if was removed because all processes were suspended
+			// fprintf(stdout,"selectFromQueue processRemoved = %d\n", processRemoved);
+			// PT->referenced[processRemoved][processBlock->pageWant[processRemoved]] = getTotalTime(&timer->clockSecs, &timer->clockNanos, &PT->referenced[processRemoved][processBlock->pageWant[processRemoved]]);
+d394 2
+d400 3
+a407 1
+	
+d410 2
+a411 2
+	// if(totalTime - timePassed > 1){//Print Memory Map every second
+	if(totalTime - timePassed > 0.5){
+d416 2
+a417 2
+	
+	if(t > 50000){//So get some feedback if all processes done and oss time not up
+a421 1
+	// if(totalTime > runTime){
+d435 8
+a442 3
+fprintf(stdout,"Page Faults: %d\n",pageFaults);
+fprintf(stdout,"Memory Accesses: %d\n",memoryAccesses);
+fprintf(stdout,"Page Fault Rate: %.9f\n",(double)pageFaults/(double)memoryAccesses);
+d444 8
+a451 2
+	if(PT->PTLR[p] != -1){
+		fprintf(stdout,"PTLR[%d] = %d, ", p, PT->PTLR[p]);
+d453 2
+d456 57
+d516 4
+a519 1
+		fprintf(stdout,"baseReg[%d] = %d, ", p, PT->baseReg[p]);
+d523 4
+a526 10
+// fprintf(stdout,"DIRTY BITS\n");
+// for(p=0; p < 256; p++){
+	 // if(PT->dirty[p] == 1){
+		 // fprintf(stdout, "1 ");
+	 // }else{
+		// fprintf(stdout, "\033[22;31m0 \033[0m"); 
+	 // }
+	 // if(p % 32 == 31){
+		 // fprintf(stdout, "\n");
+	 // }
+d528 5
+a532 10
+// fprintf(stdout,"VALID BITS\n");
+// for(p=0; p < 256; p++){
+	 // if(PT->valid[p] == 1){
+		 // fprintf(stdout, "1 ");
+	 // }else{
+		// fprintf(stdout, "\033[22;31m0 \033[0m"); 
+	 // }
+	 // if(p % 32 == 31){
+		 // fprintf(stdout, "\n");
+	 // }
+d534 1
+d546 1
+a546 1
+	printf("Master ID %d\n",getpid());
+d839 56
+d983 1
+a983 1
+		fprintf(stderr,"POP QUEUE IS EMPTY \n");
+a1068 1
+	fprintf(stdout,"Printing Process Table\n");
+d1242 1
+a1242 1
+*$Date: 2016/04/23 21:14:26 $
+d1244 3
+@
+
+
+1.3
+log
+@This is a late check-in.  Worked on it all yesterday and didn't remember to
+check it in until I layed down.  Set an alarm to do it today and got distracted.
+Anyways...
+getPage is working good with multiple processes now.  Had to change a few things
+around since not testing it so much now.  Started to create the Daemon function.
+@
+text
+@a3 1
+// int semKey2 = 8008135, semId2;//For printing resources in process.c
+a21 3
+unsigned int bv[1] = {0};//bv = bitVector. keep track of PCBs taken. Process table
+unsigned int RAM[8] = {0};//256KB available in system memory. Bit vector
+
+d26 1
+a26 1
+int processRemoved = -1, id, signaling;
+d45 4
+d96 1
+d98 2
+a101 11
+// fprintf(stdout,"This program will run and display each process initial needs upon creation,\n");
+// fprintf(stdout,"whether the process is terminating or not, the resources it deallocates or \n");
+// fprintf(stdout,"is allocated to it, and an update of the available resources whenever a process\n");
+// fprintf(stdout,"is allocated a resource or deallocates a resource.  The screen may go by fast,\n");
+// fprintf(stdout,"but I wanted to display some visual information for you to follow so you can see it works.\n");
+// fprintf(stdout,"NOTE: There are sometimes 2 shared resources rather than > 3 (see above), keyword sometimes.\n");
+// fprintf(stdout,"Mark said we didn't have to do the 15-25% resources shared (like I did), but already had it\n");
+// fprintf(stdout,"implemented and I didn't want to waste the little time I have fixing it.\n");
+fprintf(stdout,"PRESS ANY KEY TO CONTINUE\n");
+// getchar();
+
+d163 1
+a163 1
+	PT->PTLR[p] = 0;//Page Table Length Register
+a168 1
+		// PT->referenced[p][r] = genRandomDouble();
+d183 1
+a184 1
+
+d186 1
+a186 1
+daemonTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &timePassed);//For timing printing memory map
+d190 3
+a192 4
+// numAllowedConcurrently = 5;//Number of processes allowed to run at the same time
+totalNumAllowed = 8;//Number of processes allowing to be created
+runTime = 5;
+// return 0;
+d194 2
+a195 3
+	
+	// if(0){	
+	// if(((totalTime - prevTotalTime) > randTime) && processCounter < numAllowedConcurrently && processId < SOFT_LIMIT){
+a196 1
+		// fprintf(stdout,"AFTER time: %.9f, prevTotalTime: %.9f, time passed: %.9f\n",totalTime, prevTotalTime, totalTime - prevTotalTime);
+d216 6
+a221 1
+		// fprintf(stdout,"PT->PTLR[%d] = %d\n", processId, PT->PTLR[processId]);
+d223 2
+a224 2
+		if(freeFrames < PT->PTLR[processId]){//Free frames < 10% total frames. 256/10 = 26
+			fprintf(stdout,"*** Tried to fork a process, Out of RAM ***\n");
+d226 2
+a234 1
+			// nextIndex = getIndex(RAM, PT->PTLR[processId]);//Find the next open index that can hold designated amount of frames
+a237 6
+		
+		// for(r = 0; r < PT->PTLR[processId]; r++){
+			// PT->frameID[processId][r] = nextIndex;//Process #, page #, holds frame #
+			// fprintf(stdout,"frameID[%d][%d] = %d, PT->baseReg[processId] = %d, nextIndex = %d\n", processId, r, PT->frameID[processId][r], PT->baseReg[processId], nextIndex);
+			// nextIndex++;//Go to next position
+		// }
+a238 2
+		// PT->baseReg[processId] = nextIndex - PT->PTLR[processId];
+		// fprintf(stdout,"PT->baseReg[%d] = %d\n", processId, PT->baseReg[processId]);
+a243 1
+			processBlock->requesting[processId] = -1;
+a265 1
+		processCounter++;
+a266 1
+	// }
+a268 1
+		// waitRemove();
+d274 1
+a274 1
+			fprintf(stdout,"Process %d Removed from %d Queue\n", id, r);
+d276 2
+a277 3
+		fprintf(stdout,"Clear %d from Proccess table: ", processBlock->processDone);
+		clearBit(bv, processBlock->processDone);//Remove from Process Table
+		printBit(bv, 4, PT->valid);
+d306 3
+a308 1
+		fprintf(stdout,"Process %d terminating...\n", processBlock->processDone);
+a309 1
+		processCounter--;
+a317 1
+		// fprintf(stdout,"freeFrames = %d\n", freeFrames);
+a318 11
+			fprintf(stdout,"VALID BITS\n");
+			for(p=0; p < 256; p++){
+				 if(PT->valid[p] == 1){
+					 fprintf(stdout, "1 ");
+				 }else{
+					fprintf(stdout, "\033[22;31m0 \033[0m"); 
+				 }
+				 if(p % 32 == 31){
+					 fprintf(stdout, "\n");
+				 }
+			}
+d320 2
+a321 1
+			daemonTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &timePassed);//For timing printing memory map
+d323 7
+a329 4
+		PT->reqTime[signaling] = getTotalTime(&timer->clockSecs, &timer->clockNanos, &PT->reqTime[signaling]);
+		get_page(signaling, PT, processBlock, RAM, timer);
+		if(processBlock->running[signaling] == 0){
+			processBlock->pageFaults[signaling] = processBlock->pageFaults[signaling] + 1;
+d332 1
+d341 1
+a341 2
+		printQueue(PT->suspended);
+		// fprintf(stdout,"SUSPENDED %d\n", PT->suspended[0]);
+d343 1
+a343 1
+		fprintf(stdout,"%d POPPED from queue\n", processRemoved);
+a346 2
+			// fprintf(stdout,"BEFORE Dirty Bit %d = %d\n", processRemoved, PT->dirty[PT->frameID[processRemoved][processBlock->pageWant[processRemoved]]]);
+			// PT->dirty[PT->frameID[processRemoved][processBlock->pageWant[processRemoved]]] = 1;//If page modified or not
+a347 1
+			// fprintf(stdout,"AFTER %d's Dirty Bit page %d = frame %d = %d\n", processRemoved, processBlock->pageWant[processRemoved], PT->frameID[processRemoved][processBlock->pageWant[processRemoved]], PT->dirty[PT->frameID[processRemoved][processBlock->pageWant[processRemoved]]]);
+d349 2
+a350 10
+		//Print out this Process' Page Table since request Fulfilled
+		fprintf(stdout,"\033[22;32m%d's Page Table (Base Register = %d, PTLR = %d): ", processRemoved, PT->baseReg[processRemoved], PT->PTLR[processRemoved]);
+		for(p = 0; p < PT->PTLR[processRemoved]; p++){
+			if(PT->frameID[processRemoved][p] != -1){
+				fprintf(stdout,"%d ", PT->frameID[processRemoved][p]);
+			}else{
+				fprintf(stdout,". ");
+			}
+		}
+		fprintf(stdout,"\033[0m\n");
+d361 1
+a361 1
+			PT->referenced[processRemoved][processBlock->pageWant[processRemoved]] = getTotalTime(&timer->clockSecs, &timer->clockNanos, &PT->referenced[processRemoved][processBlock->pageWant[processRemoved]]);
+a362 1
+				// fprintf(stdout,"BEFORE Dirty Bit %d = %d\n", processRemoved, PT->dirty[PT->frameID[processRemoved][processBlock->pageWant[processRemoved]]]);
+a363 1
+				// fprintf(stdout,"AFTER %d's Dirty Bit page %d = frame %d = %d\n", processRemoved, processBlock->pageWant[processRemoved], PT->frameID[processRemoved][processBlock->pageWant[processRemoved]], PT->dirty[PT->frameID[processRemoved][processBlock->pageWant[processRemoved]]]);
+a364 1
+			
+d369 1
+a369 10
+			//Print out this Process' Page Table since request Fulfilled
+			fprintf(stdout,"\033[22;32m%d's Page Table (Base Register = %d, PTLR = %d): ", processRemoved, PT->baseReg[processRemoved], PT->PTLR[processRemoved]);
+			for(p = 0; p < PT->PTLR[processRemoved]; p++){
+				if(PT->frameID[processRemoved][p] != -1){
+					fprintf(stdout,"%d ", PT->frameID[processRemoved][p]);
+				}else{
+					fprintf(stdout,". ");
+				}
+			}
+			fprintf(stdout,"\033[0m\n");
+a371 7
+		// printBit(RAM, 32, PT->valid);//Print after request
+		for(p = 0; p < 18; p++){
+			if(PT->baseReg[p] != -1){
+				// fprintf(stdout,"baseReg[%d] = %d, ", p, PT->baseReg[p]);
+			}
+		}
+		// fprintf(stdout,"\n");
+d374 6
+a379 2
+	if(totalTime - timePassed > 1){//So get some feedback if all processes done and oss time not up
+		// fprintf(stdout,"Printing Memory Map\n");
+a381 6
+		for(p = 0; p < 18; p++){
+			if(PT->baseReg[p] != -1){
+				// fprintf(stdout,"baseReg[%d] = %d, ", p, PT->baseReg[p]);
+			}
+		}
+		fprintf(stdout,"\n");
+d384 2
+a385 5
+	advanceClock(&timer->clockSecs, &timer->clockNanos, 999);//advance clock to simulate overhead
+	totalTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &totalTime);
+	// fprintf(stdout,"totalTime %.9f\n", totalTime);
+	if(t > 500000){//So get some feedback if all processes done and oss time not up
+		fprintf(stdout,"totalTime %.9f, bvEmpty = %d\n", totalTime, bvEmpty(bv, numberCompleted));
+d388 1
+a388 10
+	// if(t > 500000 && countArray(processBlock->running) == 0){//So get some feedback if all processes done and oss time not up
+	if(t > 500000 && bvEmpty(bv, numberCompleted)){//So get some feedback if all processes done and oss time not up
+		fprintf(stdout,"OSS running...\n");
+		t = 0;
+	}
+	t++;
+/***************************************************************************************************************
+If time is up and no processes are running.  A process may be in a Queue still and we may not get a "Deadlocked"
+warning and termination if the time runs out before we try to allocate to that process to get the error
+****************************************************************************************************************/
+d407 1
+a407 1
+	if(PT->PTLR[p] != 0){
+d650 2
+a653 1
+	// if(member(RAM, PT->frameID[processId][processBlock->pageWant[processId]]) == 0){//Check if frame not in memory
+d655 1
+a655 3
+		// fprintf(stdout,"%d Page Faulted on %d\n", processId, PT->frameID[processId][processBlock->pageWant[processId]]);
+		fprintf(stdout,"%d Page Faulted on Page %d\n", processId, processBlock->pageWant[processId]);
+		// frameWant = PT->baseReg[processId] + processBlock->pageWant[processId];
+d657 1
+a657 12
+		// PT->frameID[processId][processBlock->pageWant[processId]] = PT->baseReg[processId] + processBlock->pageWant[processId];//Put in page table
+		PT->frameID[processId][processBlock->pageWant[processId]] = frameWant;//Put in page table
+		// fprintf(stdout,"\033[22;32m%d's Page Table (Base Register = %d, PTLR = %d): ", processId, PT->baseReg[processId], PT->PTLR[processId]);
+		// for(p = 0; p < PT->PTLR[processId]; p++){
+			// if(PT->frameID[processId][p] != -1){
+				// fprintf(stdout,"%d ", PT->frameID[processId][p]);
+			// }else{
+				// fprintf(stdout,". ");
+			// }
+		// }
+		// fprintf(stdout,"\033[0m\n");
+		// set(RAM, PT->frameID[processId][processBlock->pageWant[processId]]);//Put frame in memory
+d661 2
+a664 10
+		// fprintf(stdout,"\033[01;36m%d's Page Table (Base Register = %d, PTLR = %d): ", processId, PT->baseReg[processId], PT->PTLR[processId]);
+		for(p = 0; p < PT->PTLR[processId]; p++){
+			if(PT->frameID[processId][p] != -1){
+				// fprintf(stdout,"%d ", PT->frameID[processId][p]);
+			}else{
+				// fprintf(stdout,". ");
+			}
+		}
+		// fprintf(stdout,"\033[0m\n");
+		PT->referenced[processId][processBlock->pageWant[processId]] = 1;
+a669 1
+		processBlock->pageWant[processId] = -1;
+d672 1
+a673 2
+	processBlock->memoryAccessCount[processId] = processBlock->memoryAccessCount[processId] + 1;
+	return;
+a692 10
+	int a = 0;
+	for(p = 0; p < 18; p++){
+		for(r = 0; r < 32; r++){
+			if(PT->referenced[p][r] < frameLRUTime && PT->referenced[p][r] != 0 && inQueue(LRU, PT->frameID[p][r]) == 0){
+				PT->frameID[p][r] = a;
+			}
+			a++;
+		}
+	}
+	
+d696 1
+a696 1
+			for(r = 0; r == 31 || PT->referenced[p][r] != 0; r++){
+d700 1
+a700 1
+				if(PT->referenced[p][r] < frameLRUTime && member(RAM, PT->frameID[p][r]) == 1 && inQueue(LRU, PT->frameID[p][r]) == 0){
+d707 1
+a707 1
+					break;//Page doesn't exist in table right now
+d715 1
+a715 2
+		// fprintf(stdout,"LRU[%d] = frame %d, time %.9f\n", f, LRU[f], frameLRUTime);
+		// fprintf(stdout,"inQueue %d\n", inQueue(LRU, frameLRU));
+d723 1
+a723 1
+			fprintf(stdout,"Turning of valid bit frame %d, valid bit was %d\n", LRU[f], PT->valid[LRU[f]]);
+d731 3
+a733 1
+			fprintf(stdout,"Removing frame %d == %d, is member %d, valid bit was %d, pid %d, pageId %d\n", LRU[f], PT->frameID[pid[f]][pageId[f]], member(RAM, LRU[f]), PT->valid[LRU[f]], pid[f], pageId[f]);
+d735 1
+a735 2
+			PT->frameID[pid[f]][pageId[f]] = -1;
+			// clearBit(RAM, PT->frameID[p][r]);
+d737 1
+a737 1
+			// fprintf(stdout,"ERROR frame %d, valid bit %d\n", LRU[f], PT->valid[LRU[f]]);
+d744 13
+a756 11
+// int addPage(int processId, int suspended[18], int *tail){
+	// fprintf(stdout,"Added Process %d to suspended Queue\n", processId);
+	// if(*tail == HARD_LIMIT){ // Check to see if the Queue is full
+		// fprintf(stdout,"%d QUEUE IS FULL\n",processId);
+		// return 0;
+	// }
+	// *tail = *tail + 1;
+	// suspended[*tail % HARD_LIMIT] = processId;// Add the item to the Queue
+	// fprintf(stdout,"suspended[%d] = %d = %d, tail = %d \n", *tail % HARD_LIMIT, processId,suspended[*tail % HARD_LIMIT], *tail);
+	// return 1;
+// }
+d773 2
+a774 2
+	// for(x = 0; suspended[x] != -1; x++){
+	for(x = 0; x < 18; x++){
+d836 1
+a836 2
+	fprintf(stdout,"POP theQueue[0] = %d, tail = %d\n",theQueue[0],*tail);
+	// processId = theQueue[0];	// Get character to return
+d840 1
+a840 1
+		fprintf(stdout,"POP theQueue[%d] = %d\n",i - 1, theQueue[i]);
+a845 1
+	// fprintf(stdout,"processId %d\n",processId);
+d915 1
+a915 2
+if(size == 32){
+	fprintf(stdout,"Printing Memory Map\n");
+d918 1
+a918 1
+	fprintf(stdout,"Printing Alive Processes \n");
+d941 1
+a941 1
+		// fprintf(stdout,"%d ",member(bv, p));
+d970 1
+a970 1
+int countEmptyFrames(int bv2[], int size2){
+d972 2
+a973 1
+int j, p, i = 0, count = 0, size = 32;
+d976 2
+a977 1
+for(p=0; p < 256; p++){
+a991 36
+int getIndex(int bv2[], int framesNeed){
+	
+int isset = 0; 
+int bv, index = 0;
+bv = *bv2; 
+int j, i = 0, p;
+int emptyFrames = 0;
+// int maxPow = 1<<(size*8-1);
+for(p=0; p < 32; p++){
+   for(j=0;j<8;++j){//Go through each byte
+		isset = (bv & ((int32_t) 1 << (p * 8 + j)));
+		// fprintf(stdout, "%d ", isset);
+		if(!isset){
+			emptyFrames++;
+			// fprintf(stdout, "emptyFrames %d\n", emptyFrames);
+			if(emptyFrames >= framesNeed){
+				break;
+			}
+		}else{
+			emptyFrames = 0;
+		}	
+		index++;
+	}
+	if(emptyFrames >= framesNeed){
+		break;
+	}
+}
+
+fprintf(stdout, "Return Index: %d, emptyFrames %d, index %d\n", index + 1 - emptyFrames, emptyFrames, index);
+		
+if(emptyFrames >= framesNeed){
+	return index + 1 - emptyFrames;
+}
+return -1;//Can't fit this process into memory
+}
+
+d1092 1
+a1092 1
+*$Date: 2016/04/20 03:18:00 $
+d1094 7
+@
+
+
+1.2
+log
+@RAM, Process Table, Suspended Queue, Page Tables, PCBs, and timing all set up
+Doing memory request with 1 process right now.  Need to finish get_page then
+test with more processes.
+@
+text
+@d23 3
+a25 5
+unsigned int bv[1] = {0};//bv = bitVector. keep track of PCBs taken
+// unsigned int RAM[8] = {0};//Keep track of frames taken
+// unsigned int RAM[8];//Keep track of frames taken
+// for (r = 0; r < 8; r++ )
+	// RAM[r] = 0;
+d27 2
+d30 1
+d34 1
+a34 1
+double timePassed = 0, totalTime = 0, prevTotalTime = 0;
+d37 1
+a37 2
+
+
+a72 12
+if(hflag == 1){//Display info
+	fprintf(stdout,"The program will spawn a number of children and let them take turns requesting memory.\n");
+	fprintf(stdout,"If the time runs out, they will all DIE!\n");
+	fprintf(stdout,"The amount of children:\n");
+	fprintf(stdout,"Optional arguments:\n");
+	fprintf(stdout,"	-s (num)     sets the total number of processes (including parent)\n");
+	// fprintf(stdout,"	-t (num)     sets the timer for the alarm\n");
+	// fprintf(stdout,"	-f (string)  sets the filename the children will write to\n");
+	fprintf(stdout,"This programs handles signals from ctrl-c\n");
+	fprintf(stdout,"\n");
+}
+
+d85 24
+a108 3
+// for(r = 0; r < 256; r++){
+	// RAM[r] = r;//Create system memory
+// }
+a167 11
+// fprintf(stdout,"This program will run and display each process initial needs upon creation,\n");
+// fprintf(stdout,"whether the process is terminating or not, the resources it deallocates or \n");
+// fprintf(stdout,"is allocated to it, and an update of the available resources whenever a process\n");
+// fprintf(stdout,"is allocated a resource or deallocates a resource.  The screen may go by fast,\n");
+// fprintf(stdout,"but I wanted to display some visual information for you to follow so you can see it works.\n");
+// fprintf(stdout,"NOTE: There are sometimes 2 shared resources rather than > 3 (see above), keyword sometimes.\n");
+// fprintf(stdout,"Mark said we didn't have to do the 15-25% resources shared (like I did), but already had it\n");
+// fprintf(stdout,"implemented and I didn't want to waste the little time I have fixing it.\n");
+// fprintf(stdout,"PRESS ANY KEY TO CONTINUE\n");
+// getchar();
+
+d169 3
+a171 2
+	// PT->pageTableID[p] = p;
+	PT->PTLR[p] = 32;//Page Table Length Register
+d173 1
+a173 1
+	// fprintf(stdout,"PT->PTLR[%d] = %d\n",p, PT->PTLR[p]);
+d175 3
+a177 4
+		PT->frameID[p][r] = 0;
+		PT->refrenced[p][r] = 0;
+		PT->dirty[p][r] = 0;//If page modified or not
+		PT->valid[p][r] = 0;//If page in memory or not
+d181 4
+a184 20
+
+// for(r = 0; r < 18; r++){
+	// fprintf(stdout,"PT->pageTableID[%d] = %d\n",r, PT->pageTableID[r]);
+// }
+// for(r = 0; r < 18; r++){
+	// fprintf(stdout,"PT->PTLR[%d] = %d\n",r, PT->PTLR[r]);
+// }
+// for(r = 0; r < 18; r++){
+	// fprintf(stdout,"PT->suspended[%d] = %d\n",r, PT->suspended[r]);
+// }
+// for(p = 0; p < 18; p++){
+	// for(r = 0; r < 32; r++){
+		// fprintf(stdout,"PT->dirty[%d][%d] = %d\n",p, r, PT->dirty[p][r]);
+	// }
+// }
+// for(p = 0; p < 18; p++){
+	// for(r = 0; r < 32; r++){
+		// fprintf(stdout,"PT->valid[%d][%d] = %d\n",p, r, PT->valid[p][r]);
+	// }
+// }
+d191 1
+a191 1
+processBlock->readWriteDone = -1;
+d195 2
+d200 2
+a201 2
+totalNumAllowed = 2;//Number of processes allowing to be created
+runTime = 3;
+d207 1
+a207 4
+	// if(((totalTime - prevTotalTime) > randTime) && processId < totalNumAllowed){
+	// if(processId == 0){
+	if(processId < 1 && resources){
+		// fprintf(stdout,"processCounter %d, processId %d\n", processCounter, processId);
+d214 1
+d221 1
+a221 1
+			fprintf(stdout,"Couldn't insert %d in bv.\n", processId);
+d224 5
+a228 4
+
+		//Put in memory
+		PT->PTLR[processId] = rand() % 32 + 1;
+		fprintf(stdout,"PT->PTLR[%d] = %d\n", processId, PT->PTLR[processId]);
+d231 2
+a232 1
+			fprintf(stdout,"*** Out of RAM ***\n");
+d239 2
+a240 1
+			nextIndex = getIndex(RAM, PT->PTLR[processId]);//Find the next open index that can hold designated amount of frames
+d242 5
+a246 2
+		for(r = 0; r < PT->PTLR[processId]; r++){
+			PT->frameID[processId][r] = nextIndex;//Process #, page #, holds frame #
+d248 4
+a251 4
+			// set(RAM, nextIndex);//Put in Process Table
+			nextIndex++;//Go to next position
+		}
+		PT->baseReg[processId] = nextIndex - PT->PTLR[processId];
+a252 1
+		printBit(RAM, 32);
+d255 2
+a256 1
+			fprintf(stdout,"New child %d / %d, time: %.9f\n",processId, getpid(),prevTotalTime);
+d286 2
+a287 1
+		waitRemove();
+d289 6
+d296 5
+a300 3
+		
+		for(r = 0; r < PT->PTLR[processId]; r++){//Remove from memory
+			clearBit(RAM, PT->frameID[processBlock->processDone][r]);
+d303 1
+d317 1
+a317 1
+		char writeString[100];
+a321 1
+
+d324 1
+d333 2
+a334 1
+		fprintf(stdout,"OSS %d signaling\n", processBlock->processSignaling);
+d336 15
+a350 2
+		if(freeFrames < 25){//Free frames < 10% total frames. 256/10 = 26
+			runDaemon();
+d352 6
+a357 1
+		get_page(processBlock->processSignaling, PT, processBlock, RAM);
+d359 32
+a390 1
+		fprintf(stdout,"OSS DONE %d signaling\n", processBlock->processSignaling);
+d394 34
+a427 4
+		fprintf(stdout,"OSS %d readWriteDone = %d\n", processBlock->readWriteDone, processBlock->action[processId]);
+		processBlock->running[processBlock->readWriteDone] = 1;
+		signalRequest();
+		processBlock->readWriteDone = -1;
+a429 1
+	
+d431 2
+a432 2
+		fprintf(stdout,"Printing Memory Map\n");
+		// printBit(RAM, 32);
+d434 6
+d441 2
+a442 1
+	advanceClock(&timer->clockSecs, &timer->clockNanos);//advance clock to simulate overhead
+d444 7
+a450 1
+	if(t > 500000 && countArray(processBlock->running) == 0){//So get some feedback if all processes done and oss time not up
+d459 2
+a460 2
+	// if(totalTime > runTime && countArray(processBlock->running) == 0){
+	if(totalTime > runTime){
+d465 7
+d473 46
+d524 2
+a525 1
+		if(processBlock->running[p] == 1){//If > 0 processes running, not deadlocked
+d530 1
+a530 3
+	// if(allQueuesEmpty(20, 18, resource->blocked) == 0){//If > 0, processes running, not deadlocked
+		// childrenAlive = true;
+	// }
+a541 21
+		// if(allQueuesEmpty(20, 18, resource->blocked) == 0){
+			// fprintf(stderr,"Processes still exist in a blocked Queue\n");
+			// printQueue(20, 18, resource->blocked);
+		// }
+		// fprintf(stdout,"Still running: ");
+		// for(p = 0; p < 18; p++){
+			// if(processBlock->running[p] == 1){//If > 0 processes running, not deadlocked
+				// fprintf(stdout,"%d, ", p);
+			// }
+		// }
+		// fprintf(stdout,"\n");
+		// fprintf(stdout,"Not running: ");
+		// for(p = 0; p < 18; p++){
+			// if(processBlock->running[p] == 0){//If > 0 processes running, not deadlocked
+				// fprintf(stdout,"%d, ", p);
+			// }
+		// }
+		// fprintf(stdout,"\n");
+		// kill(-getpid(),SIGINT);
+	}
+}
+d543 1
+a543 3
+for(p = 0; p < 18; p++){
+	for(r = 0; r < 32; r++){
+		clearBit(RAM, PT->frameID[p][r]);
+d595 5
+d711 51
+a761 12
+int get_page(int processId, struct pageTable* PT, struct PCB* processBlock, int RAM[]){
+	fprintf(stdout,"get_page process %d wants page %d = frame %d\n", processId, processBlock->pageWant[processId], PT->frameID[processId][processBlock->pageWant[processId]]);
+	bool pageFault = false;
+	
+	if(member(RAM, PT->frameID[processId][processBlock->pageWant[processId]]) == 0){//Check if frame not in memory
+		set(RAM, PT->frameID[processId][processBlock->pageWant[processId]]);//Put frame in memory
+		pageFault = true;
+		fprintf(stdout,"%d Page Faulted on %d\n", processId, PT->frameID[processId][processBlock->pageWant[processId]]);
+		processBlock->running[processId] = 0;
+		addQueue(processId, PT->suspended, &PT->suspTail);//Now suspended
+	}else{
+		fprintf(stdout,"Frame %d available for: %d\n", PT->frameID[processId][processBlock->pageWant[processId]], processId);
+a762 1
+		// fprintf(stdout,"Couldn't insert %d in bv.\n", processId);
+d764 2
+a765 11
+	printBit(RAM, 32);
+	
+	// if(!pageFault){
+		// fprintf(stdout,"Frame %d available for: %d\n", PT->frameID[processId][processBlock->pageWant[processId]], processId);
+		//advance clock 15ms?  Each request for disk read/write takes about 15ms to be fulfilled
+		// signalRequest();
+	// }else{
+		// fprintf(stdout,"Memory '#' NOT granted to: %d\n", processId);
+		// processBlock->running[processId] = 0;
+		// addQueue(processId, PT->suspended, &PT->suspTail);//Now suspended
+	// }
+d768 74
+a841 1
+void runDaemon(){
+d846 12
+d859 1
+a859 1
+	fprintf(stdout,"Added Process %d to suspended Queue\n", processId);
+d873 2
+a874 1
+	for(x = 0; suspended[x] != -1; x++){
+d929 22
+d954 1
+a954 1
+		if(array[x] != 0){
+d961 1
+a961 1
+void advanceClock(int *clockSecs, int *clockNanos){//1 sec = 1,000 milli = 1,000,000 micro = 1,000,000,000 nano
+d963 9
+a971 2
+	// int randTime = rand() % 9999 + 1;//simulate overhead activity for each iteration by 0.001s
+	int randTime = rand() % 999 + 1;//simulate overhead activity for each iteration by 0.0001s
+a972 1
+	// fprintf(stdout,"ENTER clockNanos %d, randTime %d, %d += %d\n",*clockNanos,randTime,*clockNanos,randTime);
+d979 1
+d995 1
+d998 1
+a1006 1
+	// fprintf(stdout,"set flag: %d\n", flag);
+d1009 2
+a1010 3
+  // printf("Setting bit %d, pos %d, = %d \n",j, pos, bv[j] | flag);
+  //OR this is all the above consolidated: 
+  // bv[i/32] |= 1 << (i%32);
+d1014 1
+a1014 1
+void printBit(int bv[], int size){//set value in bv.  i is value to set in bv array
+d1016 1
+a1016 1
+
+d1019 1
+d1022 1
+d1024 43
+a1066 8
+int numBits = size * 8;
+fprintf(stdout,"[");
+for(p=0; p < numBits; p++){
+	fprintf(stdout,"%d ",member(bv, p));
+	i++;
+	if(i == 32){
+		fprintf(stdout,"\n");
+		i = 0;
+d1069 1
+d1074 1
+a1074 2
+int bv;
+bv = *bv2; 
+d1077 10
+a1086 6
+for(p=0; p < size; p++){
+   for(j=0;j<8;++j){//Go through each byte
+		if(bv&maxPow){
+			count++;
+		}
+		bv = bv<<1;
+d1089 2
+a1090 1
+return (size * 8) - count;
+a1177 1
+	//fprintf(stdout,"waitClock child %d\n",childId);
+a1186 1
+	//fprintf(stdout,"signalClock\n");
+a1195 1
+	// fprintf(stdout,"waitClock child %d\n",childId);
+a1204 1
+	// fprintf(stdout,"signalClock\n");
+d1229 1
+a1229 1
+*$Date: 2016/04/17 02:37:48 $
+d1231 5
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d19 1
+d23 6
+a28 1
+int bv[1] = {0};//bv = bitVector. keep track of PCBs taken
+d30 1
+a30 1
+int processId = 0, processCounter = 0, processToRunId = -1, processRequestId = -1;
+d36 1
+a36 1
+int p, r;//for loop vars
+d72 1
+a72 1
+ 
+d97 2
+a98 32
+for(r = 0; r < 256; r++){
+	RAM[r] = r;//Create system memory
+}
+
+for(p = 0; p < 18; p++){
+	PT->pageTableID[p] = p;
+	PT->PTLR[p] = 32;//Page Table Length Register
+	PT->suspended[p] = -1;
+	// fprintf(stdout,"PT->PTLR[%d] = %d\n",p, PT->PTLR[p]);
+	for(r = 0; r < 32; r++){
+		PT->dirty[p][r] = -1;//If page modified or not
+		PT->valid[p][r] = -1;//If page in memory or not
+	}
+}
+// for(r = 0; r < 18; r++){
+	// fprintf(stdout,"PT->pageTableID[%d] = %d\n",r, PT->pageTableID[r]);
+// }
+// for(r = 0; r < 18; r++){
+	// fprintf(stdout,"PT->PTLR[%d] = %d\n",r, PT->PTLR[r]);
+// }
+// for(r = 0; r < 18; r++){
+	// fprintf(stdout,"PT->suspended[%d] = %d\n",r, PT->suspended[r]);
+// }
+// for(p = 0; p < 18; p++){
+	// for(r = 0; r < 32; r++){
+		// fprintf(stdout,"PT->dirty[%d][%d] = %d\n",p, r, PT->dirty[p][r]);
+	// }
+// }
+// for(p = 0; p < 18; p++){
+	// for(r = 0; r < 32; r++){
+		// fprintf(stdout,"PT->valid[%d][%d] = %d\n",p, r, PT->valid[p][r]);
+	// }
+a99 1
+// return 0;
+d170 34
+d209 1
+d216 1
+a216 1
+totalNumAllowed = 1;//Number of processes allowing to be created
+d218 1
+d224 2
+a225 1
+	if(processId == 0){
+d237 1
+d242 25
+d277 1
+a277 1
+		
+d300 5
+a304 1
+		clearBit(bv, processBlock->processDone);
+d336 5
+a340 1
+		get_page(processBlock->processSignaling, PT, processBlock);
+d345 7
+d355 1
+d418 7
+a424 1
+		kill(-getpid(),SIGINT);
+d481 5
+d587 3
+a589 5
+int get_page(int processId, struct pageTable* PT, struct PCB* processBlock){
+	fprintf(stdout,"get_page process id: %d\n", processId);
+	bool memoryGranted = false;
+	
+	
+d591 4
+a594 8
+	
+	memoryGranted = true;
+	if(memoryGranted){
+		fprintf(stdout,"Memory '#' granted to: %d\n", processId);
+		//advance clock 15ms?  Each request for disk read/write takes about 15ms to be fulfilled
+		signalRequest();
+	}else{
+		fprintf(stdout,"Memory '#' NOT granted to: %d\n", processId);
+d597 4
+d602 16
+d632 1
+a632 1
+void printQueue(int p, int suspended[p]){
+d642 1
+a642 1
+int inQueue(int p, int suspended[p], int processId){
+d652 1
+a652 1
+int queueEmpty(int p, int suspended[p]){
+d732 1
+a732 1
+  int j = i/32;//Get the array position
+d735 1
+a736 1
+  int p;
+d738 44
+d783 34
+a816 2
+  bv[j] = bv[j] | flag;    // Set the bit at the i-th position in bv[i]
+  //OR this is all the above consolidated: bv[i/32] |= 1 << (i%32);
+d922 6
+a927 3
+/*$Author$
+*$Date$
+*$Log$
+@

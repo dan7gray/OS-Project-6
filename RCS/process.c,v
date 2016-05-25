@@ -1,0 +1,768 @@
+head	1.5;
+access;
+symbols;
+locks
+	o2-gray:1.5; strict;
+comment	@ * @;
+
+
+1.5
+date	2016.04.26.15.04.25;	author o2-gray;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2016.04.24.03.16.34;	author o2-gray;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2016.04.23.21.16.51;	author o2-gray;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2016.04.20.03.20.08;	author o2-gray;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2016.04.17.02.43.50;	author o2-gray;	state Exp;
+branches;
+next	;
+
+
+desc
+@Laid out framework.
+@
+
+
+1.5
+log
+@Processes communicating well with OSS now
+@
+text
+@#include "functs.h"
+
+int semKey = 8675309, semId;
+int semKeyR = 3333333, semIdR;//For Removing processes
+int semKeyReq = 7777777, semIdReq;//For Requesting memory in process.c
+int semKeyCond = 90210, semIdCond;//For removing process
+int key = 4444444;
+int key2 = 5555555;
+int key3 = 6666666;
+int shmidVal;
+int shmidVal2;
+int shmidVal3;
+
+int main(int argc, char * argv[]){
+
+char *p;
+int processId = strtol(argv[0],&p,10);
+shmidVal = strtol(argv[1],&p,10);
+shmidVal2 = strtol(argv[2],&p,10);
+shmidVal3 = strtol(argv[3],&p,10);
+
+double currTime, arrivalTime, startTime, endTime, currRunTime;
+srand(time(NULL));
+int processRequestId = -2;//Initialize to something other than process number
+int terminate = 0, accessCount = 0, readWrite = 0, checkTerminate = rand() % 200 + 900;// [900-1100]
+int r;//For for loops
+int memWant = -1;
+bool processSusp = false;//True if process suspended (in a Queue)
+double genRandomDouble(int processId);//No funct overloading in C, this oss & process funct different
+
+struct PCB *processBlock;
+struct timing *timer;
+struct pageTable *PT;
+
+//Attach to shared mem
+if((processBlock = (struct PCB *)shmat(shmidVal,(void *)0, 0)) == (void *)-1){ //Returns void*
+        fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+        perror("shmat");
+        exit(EXIT_FAILURE);
+}
+if((timer = (struct timing *)shmat(shmidVal2, 0, 0)) == (void *)-1){ //Returns void*
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("shmat");
+	exit(EXIT_FAILURE);
+}
+if((PT = (struct pageTable*)shmat(shmidVal3, 0, 0)) == (void *)-1){ //Returns void*
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror("shmat");
+	exit(EXIT_FAILURE);
+}
+
+//Get/Create semaphores
+if((semId = semget(semKey,1,0)) == -1){//For clock
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror(" semget");
+	exit(EXIT_FAILURE);
+}
+if((semIdCond = semget(semKeyCond,1,0)) == -1){//For memory requests
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror(" semget");
+	exit(EXIT_FAILURE);
+}
+if((semIdReq = semget(semKeyReq,1,0)) == -1){//For resource requests
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror(" semget");
+	exit(EXIT_FAILURE);
+}
+if((semIdR = semget(semKeyR,1,0)) == -1){//For when no longer suspended
+	fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+	perror(" semget");
+	exit(EXIT_FAILURE);
+}
+
+arrivalTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &arrivalTime);//Get arrival time
+processBlock->turnAround[processId] = arrivalTime;
+startTime = arrivalTime;//Get start time
+int t = 0;
+checkTerminate = rand() % 200 + 900;//New terminate time 900-1100
+while(true){
+	advanceClock(&timer->clockSecs, &timer->clockNanos, 999);//advance clock to simulate overhead
+	currRunTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &currRunTime);//Get current time
+
+if(processBlock->memoryAccessCount[processId] >= checkTerminate){//Check if process chould terminate at random times between 0 and 250ms
+	accessCount =  accessCount + processBlock->memoryAccessCount[processId];
+	terminate = rand() % (processId + 10);// + processId so concurrent processes don't get same num since seeded with time, +10 so large enough to % again
+	terminate = terminate % 2;//Check if process will terminate
+	if(terminate == 1){//Deallocate all resources and end
+		waitRemove();
+		/***************************************
+		Signal OSS to Deallocate/Release Memory
+		***************************************/
+		processBlock->processDone = processId;//Signal OSS to Remove from bitVector
+		
+		processBlock->memoryAccessCount[processId] = accessCount;
+		endTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &endTime);//Get time ended at
+		processBlock->turnAround[processId] = endTime - processBlock->turnAround[processId];// turnAround = endTime - arrivalTime;
+		processBlock->cpuTimeUsed[processId] = processBlock->cpuTimeUsed[processId] + processBlock->turnAround[processId] - processBlock->idleTotal[processId];
+		processBlock->totalSystemTime[processId] = endTime - processBlock->totalSystemTime[processId];//endTime - Creation time
+		fprintf(stdout,"FINAL %d: arrivalTime %.9f, endTime %.9f, turnAround: %.9f, cpuTimeUsed: %.9f, memoryAccessCount %d\n", processId, arrivalTime, endTime, processBlock->turnAround[processId], processBlock->cpuTimeUsed[processId], processBlock->memoryAccessCount[processId]);
+		return 0;
+	}
+	fprintf(stdout,"Process %d NOT TERMINATING: memoryAccessCount = %d\n", processId, processBlock->memoryAccessCount[processId]);
+	processBlock->memoryAccessCount[processId] = 0;
+	checkTerminate = rand() % 200 + 900;//New terminate time 900-1100
+}
+ 
+//Add processId below to to make more random between processes
+processBlock->action[processId] = (rand() + processId) % 2;//Determine if process will read or write. 0 = read, 1 = write.
+if(PT->PTLR[processId] != 1){//If have more than one page
+	processBlock->pageWant[processId] = rand() % PT->PTLR[processId];//Pick a random page from PT to use
+}else{//rand() % 1 = rand().  If only have 1 page in table
+	processBlock->pageWant[processId] = 0;
+}
+
+currTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &currTime);//Get current time
+// processBlock->processSignaling = processId;
+processBlock->processSignal[processId] = processId;
+if(t == 0){
+	fprintf(stdout,"%d: In Process: processSignaling[%d] = %d\n", processId, processId, processBlock->processSignal[processId]);
+}
+// while(processBlock->processSignaling == processId || processBlock->running[processId] == 0){
+//While this Processes signal (Memory Request) hasn't been serviced or it is suspended
+while(processBlock->processSignal[processId] == processId || processBlock->running[processId] == 0){
+	// waitRequest(processBlock->processSignaling, processBlock->running[processId]);//Only one can deallocate at a time
+	waitRequest(processBlock->processSignal[processId], processBlock->running[processId]);//Only one can deallocate at a time
+	if(t == 0){
+		// fprintf(stdout,"%d: Waiting... processSignaling[%d] = %d, running = %d\n", processId, processId, processBlock->processSignal[processId], processBlock->running[processId]);
+	}
+	if(processBlock->processSignal[processId] == processId){//Signal if OSS hasn't got this request yet
+		processBlock->processSignaling = processId;//Signal variable
+	}
+	if(processBlock->running[processId] == 0){
+		currRunTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &currRunTime);//Get current time
+		if(currRunTime - currTime > 0.015 && processBlock->readWriteDone == -1 && processBlock->running[processId] == 0){
+			processBlock->readWriteDone = processId;
+			// currRunTime = currTime;
+		}
+	}
+}
+fprintf(stdout,"Process %d DONE with request\n", processId);
+t++;
+}//End While(true)
+return 0;
+}
+
+void sigHandler(int mysignal){
+	pid_t childId;
+	struct PCB *processBlock;
+	struct timing *timer;
+	struct pageTable *PT;
+
+    //Attach to shared memory
+	if((processBlock = (struct PCB *)shmat(shmidVal, (void *)0, 0)) == (void *)-1){ //Returns void*
+		fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+		perror("shmat");
+		exit(EXIT_FAILURE);
+	}
+	if((timer = (struct timing *)shmat(shmidVal2, 0, 0)) == (void *)-1){ //Returns void*
+		fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+		perror("shmat");
+		exit(EXIT_FAILURE);
+	}
+	if((PT = (struct pageTable *)shmat(shmidVal3, 0, 0)) == (void *)-1){ //Returns void*
+		fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+		perror("shmat");
+		exit(EXIT_FAILURE);
+	}
+        printf("SLAVE process id %d  signal %d\n", getpid(),mysignal);
+	switch(mysignal){
+			case SIGINT:
+				fprintf(stderr,"Child %d dying because of an interrupt!\n",childId);
+				//Detach and Remove shared mem
+				if(shmdt(processBlock) == -1){
+					fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+					perror("shmdt");
+				   exit(EXIT_FAILURE);
+				}
+				if (shmctl(shmidVal,IPC_RMID,NULL) == -1){
+					fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+					perror("shmctl");
+					exit(EXIT_FAILURE);
+				}
+				if(shmdt(timer) == -1){
+					fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+						perror("shmdt");
+					   exit(EXIT_FAILURE);
+				}
+				if (shmctl(shmidVal2,IPC_RMID,NULL) == -1){
+					fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+					perror("shmctl");
+					exit(EXIT_FAILURE);
+				}
+				if(shmdt(PT) == -1){
+					fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+						perror("shmdt");
+					   exit(EXIT_FAILURE);
+				}
+				if (shmctl(shmidVal3,IPC_RMID,NULL) == -1){
+					fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+					perror("shmctl");
+					exit(EXIT_FAILURE);
+				}
+				
+				//Delete Semaphore.  IPC_RMID Remove the specified semaphore set
+				if(semctl(semId, 0, IPC_RMID) == -1){
+					fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+					perror("semctl");
+					exit(EXIT_FAILURE);
+				}
+				if(semctl(semIdCond, 0, IPC_RMID) == -1){
+					fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+					perror("semctl");
+					exit(EXIT_FAILURE);
+				}
+				if(semctl(semIdReq, 0, IPC_RMID) == -1){
+					fprintf(stderr,"%s Line %d ",__FILE__,__LINE__);
+					perror("semctl");
+					exit(EXIT_FAILURE);
+				}
+				//raise(SIGTERM);
+				exit(1);
+				break;
+		   default:
+				printf("Default signal in slave %d\n", mysignal);
+				break;
+	}
+	return;
+}
+
+void initSigHandler(){
+	struct sigaction signalAct;
+	signalAct.sa_handler = &sigHandler;//Setup sigHandler
+	signalAct.sa_flags = SA_RESTART|SA_SIGINFO;
+	sigfillset(&signalAct.sa_mask);//Block all other signals
+
+	if(sigaction(SIGINT, &signalAct, NULL) == -1){
+			perror("SIGINT receipt failed");
+	}
+}
+
+int inQueue(int suspended[], int processId){
+	int i;
+	for(i = 0; suspended[i] != -1; i++){//Move elements forward in the queue
+		if(suspended[i] == processId){
+			return 1;//Process already in queue
+		}
+	}
+	return 0;//Process not in queue
+}
+
+int addQueue(int processId, int suspended[18], int *tail){
+	// fprintf(stdout,"Added Process %d to suspended Queue\n", processId);
+	if(*tail == HARD_LIMIT){ // Check to see if the Queue is full
+		fprintf(stdout,"%d QUEUE IS FULL\n",processId);
+		return 0;
+	}
+	*tail = *tail + 1;
+	suspended[*tail % HARD_LIMIT] = processId;// Add the item to the Queue
+	// fprintf(stdout,"suspended[%d] = %d = %d, tail = %d \n", *tail % HARD_LIMIT, processId,suspended[*tail % HARD_LIMIT], *tail);
+	return 1;
+}
+
+int selectFromQueue(int suspended[], int *tail, int processId){
+// int selectFromQueue(int r, int p, int suspended[r][p], int resType, int *tail, int processId){
+	if(*tail == -1){// Check for empty Queue
+		fprintf(stderr,"SUSPENDED QUEUE IS EMPTY \n");
+		return -1;  // Return 0 if queue is empty
+	}else{
+		*tail = *tail - 1;
+		int i = 0;
+		while(suspended[i] != processId){//Find element in queue
+			i++;
+		}
+		// fprintf(stdout,"Id Found suspended[%d] = %d\n",i, suspended[i]);
+		processId = suspended[i];// Get Id to return
+		suspended[i] = -1;
+		
+		while(suspended[i + 1] != -1){//Move elements forward in the queue
+			suspended[i] = suspended[i + 1];
+			i++; // fprintf(stdout,"Shift suspended[%d] = %d\n",i , suspended[i + 1]);
+		}
+		// fprintf(stdout,"suspended[%d] = 0\n",i);
+		suspended[i] = -1;//Set last spot that was filled to -1 (nothing) since process moved up in queue
+		// fprintf(stdout,"Process: Select queue return: %d\n",processId);
+		return processId;// Return popped Id
+	}
+}
+
+void advanceClock(int *clockSecs, int *clockNanos, int amount){//1 sec = 1,000 milli = 1,000,000 micro = 1,000,000,000 nano
+	waitClock();
+	int randTime;
+	randTime = rand() % amount + 1;//simulate overhead activity for each iteration by 0.0001s
+	// fprintf(stdout,"ENTER clockSecs %d, clockNanos %d, randTime %d, %d += %d\n",*clockSecs,*clockNanos,randTime,*clockNanos,randTime);
+	*clockNanos += randTime;
+	if(*clockNanos > 999999999){
+		*clockSecs = *clockSecs + 1;
+		*clockNanos -= 1000000000;
+	}
+	// fprintf(stdout,"LEAVE clockSecs %d, clockNanos %d\n",*clockSecs,*clockNanos);
+	signalClock();
+	return;
+}
+
+double getTotalTime(int *clockSecs, int *clockNanos, double *time){
+	*time = (double)*clockSecs + ((double)*clockNanos/1000000000);
+	return *time;
+}
+
+double genRandomDouble(int processId){//72500000ns == 72.5 millisecs == .725s
+	// fprintf(stdout,"returning %.9f\n", ((double)rand() * ( 0.5 - 0 ) ) / (double)RAND_MAX + 0);
+	double randNum = (double)rand() + (double)processId;// + processId so concurrent processes don't get same num since seeded with time
+	return (randNum * ( 0.25 - 0 ) ) / (double)RAND_MAX + 0;
+	// return ((double)rand() * ( 0.25 - 0 ) ) / (double)RAND_MAX + 0;
+}
+
+void waitClock(){
+	operation.sem_num = 0;/* Which semaphore in the semaphore array*/
+    operation.sem_op = -1;/* Subtract 1 from semaphore value*/
+    operation.sem_flg = 0;/* Set the flag so we will wait*/
+    if(semop(semId, &operation, 1) == -1){
+        exit(EXIT_FAILURE);
+    }
+}
+
+void signalClock(){
+	operation.sem_num = 0;/* Which semaphore in the semaphore array*/
+    operation.sem_op = 1;/* Add 1 to semaphore value*/
+    operation.sem_flg = 0;/* Set the flag so we will wait*/
+	if(semop(semId, &operation, 1) == -1){
+        exit(EXIT_FAILURE);
+    }
+}
+
+void waitRequest(int processRequesting, int running){
+	if(processRequesting == -1 && running == 1){
+		request.sem_num = 0;/* Which semaphore in the semaphore array*/
+		request.sem_op = -1;/* Subtract 1 from semaphore value*/
+		request.sem_flg = 0;/* Set the flag so we will wait*/
+		if(semop(semIdReq, &request, 1) == -1){
+			exit(EXIT_FAILURE);
+		}
+	}
+}
+
+void waitSem(){
+	condition.sem_num = 0;/* Which semaphore in the semaphore array*/
+    condition.sem_op = -1;/* Subtract 1 from semaphore value*/
+    condition.sem_flg = 0;/* Set the flag so we will wait*/
+    if(semop(semIdCond, &condition, 1) == -1){
+        exit(EXIT_FAILURE);
+    }
+}
+
+void signalSem(){
+	condition.sem_num = 0;/* Which semaphore in the semaphore array*/
+    condition.sem_op = 1;/* Add 1 to semaphore value*/
+    condition.sem_flg = 0;/* Set the flag so we will wait*/
+	if(semop(semIdCond, &condition, 1) == -1){
+        exit(EXIT_FAILURE);
+    }
+}
+
+void waitRemove(){
+	removeP.sem_num = 0;/* Which semaphore in the semaphore array*/
+    removeP.sem_op = -1;/* Subtract 1 from semaphore value*/
+    removeP.sem_flg = 0;/* Set the flag so we will wait*/
+    if(semop(semIdR, &removeP, 1) == -1){
+        exit(EXIT_FAILURE);
+    }
+}
+
+/*$Author: o2-gray $
+*$Date: 2016/04/24 03:16:34 $
+*$Log: process.c,v $
+*Revision 1.4  2016/04/24 03:16:34  o2-gray
+*Just need a little more testing with multiple processes then need to do statistics.
+*Already writing to log.txt when process ends.
+*
+*Revision 1.3  2016/04/23 21:16:51  o2-gray
+*Nothing new really, changed a semaphore around with process.c and oss.c
+*to make it work properly.  Clearly wasn't thinking straight before bed.
+*
+*Revision 1.2  2016/04/20 03:20:08  o2-gray
+*Set up and putting in Page Requests to oss.
+*
+*Revision 1.1  2016/04/17 02:43:50  o2-gray
+*Initial revision
+*
+*/
+@
+
+
+1.4
+log
+@Just need a little more testing with multiple processes then need to do statistics.
+Already writing to log.txt when process ends.
+@
+text
+@d77 1
+a77 2
+// fprintf(stdout,"ENTER %d startTime time: %.9f\n",processId, startTime);
+// checkTerminate = rand() % 200 + 400;
+a88 1
+		// fprintf(stdout,"Process %d START TERMINATING: memoryAccessCount = %d\n", processId, processBlock->memoryAccessCount[processId]);
+d99 1
+a99 1
+		// fprintf(stdout,"FINAL %d: arrivalTime %.9f, endTime %.9f, turnAround: %.9f, cpuTimeUsed: %.9f, memoryAccessCount %d\n", processId, arrivalTime, endTime, processBlock->turnAround[processId], processBlock->cpuTimeUsed[processId], processBlock->memoryAccessCount[processId]);
+d102 1
+a102 2
+	// fprintf(stdout,"Process %d NOT TERMINATING: memoryAccessCount = %d\n", processId, processBlock->memoryAccessCount[processId]);
+	fprintf(stdout,"Process %d NOT Terminating...\n", processId);
+d104 1
+a104 2
+	checkTerminate = rand() % 200 + 400;
+	// checkTerminate = rand() % 200 + 900;//New terminate time 900-1100
+a114 2
+// processBlock->processSignaling[processId] = processId;
+
+d116 16
+a131 5
+processBlock->processSignaling = processId;
+while(processBlock->processSignaling == processId || processBlock->running[processId] == 0){
+	waitRequest(processBlock->processSignaling, processBlock->running[processId]);//Only one can deallocate at a time
+	// waitRequest(processBlock->processSignaling[processId], processBlock->running[processId]);//Only one can deallocate at a time
+	// fprintf(stdout,"%d: Waiting... processSignaling = %d,   running = %d\n", processId, processBlock->processSignaling, processBlock->running[processId]);
+a133 1
+		// fprintf(stdout,"currRunTime: %.9f - %.9f = %.9f, processSignaling = % d, running = %d\n", currRunTime, currTime, currRunTime - currTime, processBlock->processSignaling[processId], processBlock->running[processId]);
+d136 1
+a136 2
+			currRunTime = currTime;
+			// fprintf(stdout,"processBlock->readWriteDone = %d\n", processId);
+d140 2
+a141 3
+
+// fprintf(stdout,"Process %d after Request\n", processId);
+
+d373 1
+a373 1
+*$Date: 2016/04/23 21:16:51 $
+d375 4
+@
+
+
+1.3
+log
+@Nothing new really, changed a semaphore around with process.c and oss.c
+to make it work properly.  Clearly wasn't thinking straight before bed.
+@
+text
+@a3 1
+// int semKey2 = 8008135, semId2;
+a21 2
+// fprintf(stdout,"Process %d running\n",processId);
+
+d25 1
+a25 1
+int terminate = 0, memoryAccessCount = 0, readWrite = 0, checkTerminate = rand() % 200 + 900;// [900-1100]
+a73 2
+int t = 0;
+
+d76 1
+a76 1
+startTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &startTime);//Get start time
+d78 2
+a79 2
+// checkTerminate = 200;
+checkTerminate = rand() % 200 + 400;
+a80 1
+	// fprintf(stdout,"Process %d, memoryAccessCount %d\n",processId, memoryAccessCount);
+a83 1
+// if(memoryAccessCount >= checkTerminate){//Check if process chould terminate at random times between 0 and 250ms
+d85 1
+a88 1
+		// waitSem();
+d90 1
+a90 1
+		fprintf(stdout,"Process %d START TERMINATING: memoryAccessCount = %d\n", processId, memoryAccessCount);
+d96 1
+d101 1
+a101 3
+		fprintf(stdout,"%d: arrivalTime %.9f, endTime %.9f, turnAround: %.9f, cpuTimeUsed: %.9f\n", processId, arrivalTime, endTime, processBlock->turnAround[processId], processBlock->cpuTimeUsed[processId]);
+		// signalSem();
+		// break;
+d104 2
+a105 1
+	fprintf(stdout,"Process %d NOT TERMINATING: memoryAccessCount = %d\n", processId, memoryAccessCount);
+a107 1
+	// memoryAccessCount = 0;
+a112 1
+// fprintf(stdout,"%d ACTION %d\n", processId, processBlock->action[processId]);
+d115 1
+a115 1
+}else{//rand() % 1 = rand().  If only have 1 page
+d118 2
+a119 1
+// fprintf(stdout,"pageWant[%d]  = %d\n", processId, processBlock->pageWant[processId]);
+d122 1
+a122 3
+// fprintf(stdout,"%d: signaling: %d, START currTime %.9f\n", processId, processBlock->processSignaling, currTime);
+// while(processBlock->processSignaling != -1 || processBlock->running[processId] == 0){
+	processBlock->processSignaling = processId;
+d124 2
+a125 6
+	// waitRequest(processBlock->processSignaling, processBlock->running[processId]);//Only one can deallocate at a time
+	waitRequest(processBlock->processSignaling, processBlock->running[processId], &memoryAccessCount);//Only one can deallocate at a time
+	// if(t > 80000){
+		// fprintf(stdout,"%d: Waiting... processSignaling = %d,   running = %d\n", processId, processBlock->processSignaling, processBlock->running[processId]);
+		// t = 0;
+	// }
+d129 1
+a129 1
+		// fprintf(stdout,"currRunTime: %.9f - %.9f = %.9f, processSignaling = % d, running = %d\n", currRunTime, currTime, currRunTime - currTime, processBlock->processSignaling, processBlock->running[processId]);
+d133 1
+a133 1
+			fprintf(stdout,"processBlock->readWriteDone = %d\n", processId);
+a136 10
+// memoryAccessCount++;
+// fprintf(stdout,"%d SIGNALED to RUN AGAIN 15ms passed, memoryAccessCount = %d\n", processId, memoryAccessCount);
+// fprintf(stdout,"%d SIGNALED to RUN AGAIN 15ms passed, memoryAccessCount = %d\n", processId, processBlock->memoryAccessCount[processId]);
+}
+// processBlock->processDone = processId;//Remove from bitVector
+endTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &endTime);//Get time ended at
+processBlock->totalSystemTime[processId] = endTime - processBlock->totalSystemTime[processId];//endTime - Creation time
+processBlock->turnAround[processId] = endTime - processBlock->turnAround[processId];// turnAround = endTime - arrivalTime;
+processBlock->cpuTimeUsed[processId] = processBlock->cpuTimeUsed[processId] + processBlock->turnAround[processId] - processBlock->idleTotal[processId];
+fprintf(stdout,"FINAL %d: arrivalTime %.9f, endTime %.9f, turnAround: %.9f, cpuTimeUsed: %.9f\n", processId, arrivalTime, endTime, processBlock->turnAround[processId], processBlock->cpuTimeUsed[processId]);
+d138 3
+d249 12
+d332 1
+a332 2
+void waitRequest(int processRequesting, int running, int *memoryAccessCount){
+	// if(processRequesting == -1){
+d340 1
+a340 14
+		// *memoryAccessCount++;
+		// *memoryAccessCount = *memoryAccessCount + 1;
+		// fprintf(stdout,"IN SEM memoryAccessCount %d\n", *memoryAccessCount);
+	}
+	// else if(processRequesting == -1 && running == 0){
+		// if(processBlock->running[processId] == 0){
+			// currRunTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &currRunTime);//Get current time
+			// if(currRunTime - currTime > 0.015 && processBlock->readWriteDone == -1 && processBlock->running[processId] == 0){
+				// processBlock->readWriteDone = processId;
+				// currRunTime = currTime;
+				// fprintf(stdout,"processBlock->readWriteDone = %d\n", processId);
+			// }
+		// }
+	// }
+d371 1
+a371 1
+*$Date: 2016/04/20 03:20:08 $
+d373 4
+@
+
+
+1.2
+log
+@Set up and putting in Page Requests to oss.
+@
+text
+@d5 1
+d61 1
+a61 1
+if((semIdCond = semget(semKeyCond,1,0)) == -1){//For resource requests
+d71 5
+d78 1
+d82 3
+d86 2
+a88 1
+	fprintf(stdout,"ENTER %d Running time: %.9f\n",processId, currRunTime);
+d90 2
+a91 1
+if(memoryAccessCount >= checkTerminate){//Check if process chould terminate at random times between 0 and 250ms
+d95 8
+a102 12
+		waitSem();
+		/***************************
+		Deallocate/Release resources
+		***************************/
+		processBlock->processDone = processId;//Remove from bitVector
+		processBlock->running[processId] = 0;
+		for(r = 0; r < 20; r++){
+			if(inQueue(PT->suspended, processId)){//If process suspended in a queue, remove it
+				int id = selectFromQueue(PT->suspended, &PT->suspTail, processId);
+				fprintf(stdout,"Process %d Removed from %d Queue\n", id, r);
+			}
+		}
+d108 2
+a109 1
+		signalSem();
+d112 5
+a116 1
+	checkTerminate = rand() % 200 + 900;//New terminate time
+d119 4
+a122 4
+
+processBlock->action[processId] = rand() % 2;//Determine if process will read or write. 0 = read, 1 = write
+// memWant = 1;
+if(PT->PTLR[processId] != 1){
+d124 1
+a124 1
+}else{//rand() % 1 = rand()
+d127 2
+a128 1
+processBlock->processSignaling = processId;
+d130 11
+a140 5
+fprintf(stdout,"%d: signaling: %d, START currTime %.9f\n", processId, processBlock->processSignaling, currTime);
+while(processBlock->processSignaling != -1 || processBlock->running[processId] == 0){
+	// waitRequest(processBlock->processSignaling);//Only one can deallocate at a time
+	waitRequest(processBlock->processSignaling, processBlock->running[processId]);//Only one can deallocate at a time
+	fprintf(stdout,"%d: Waiting...    running = %d\n", processId, processBlock->running[processId]);
+d143 2
+a144 2
+		fprintf(stdout,"currRunTime: %.9f - %.9f = %.9f, processSignaling = % d, running = %d\n", currRunTime, currTime, currRunTime - currTime, processBlock->processSignaling, processBlock->running[processId]);
+		if(currRunTime - currTime > 0.015){
+d146 2
+a149 1
+	sleep(1);
+d151 3
+a153 6
+while(processBlock->running[processId] == 0){
+	currRunTime = getTotalTime(&timer->clockSecs, &timer->clockNanos, &currRunTime);//Get current time
+	fprintf(stdout,"currRunTime: %.9f - %.9f = %.9f, processSignaling = % d, running = %d\n", currRunTime, currTime, currRunTime - currTime, processBlock->processSignaling, processBlock->running[processId]);
+	if(currRunTime - currTime > 0.015){
+		processBlock->readWriteDone = processId;
+	}
+d155 1
+a155 8
+
+memoryAccessCount++;
+fprintf(stdout,"FINAL currRunTime: %.9f - %.9f = %.9f, processSignaling = % d, running = %d\n", currRunTime, currTime, currRunTime - currTime, processBlock->processSignaling, processBlock->running[processId]);
+// signalSem();
+
+break;
+}
+processBlock->processDone = processId;//Remove from bitVector
+d160 2
+a161 2
+fprintf(stdout,"%d: arrivalTime %.9f, endTime %.9f, turnAround: %.9f, cpuTimeUsed: %.9f\n", processId, arrivalTime, endTime, processBlock->turnAround[processId], processBlock->cpuTimeUsed[processId]);
+// printf("%d is Done\n",processId);
+d296 1
+a296 1
+void advanceClock(int *clockSecs, int *clockNanos){//1 sec = 1,000 milli = 1,000,000 micro = 1,000,000,000 nano
+d298 3
+a300 1
+	int randTime = rand() % 999 + 1;//simulate overhead activity for each iteration
+d306 1
+a306 1
+	*clockSecs = *clockSecs + 1;
+d308 1
+d341 1
+a341 1
+void waitRequest(int processRequesting, int running){
+d350 14
+a363 1
+	}
+a365 11
+// void signalRequest(){
+	// condition.sem_num = 0;/* Which semaphore in the semaphore array*/
+	// condition.sem_op = 1;/* Add 1 to semaphore value*/
+	// condition.sem_flg = 0;/* Set the flag so we will wait*/
+	// if(semop(semIdCond, &condition, 1) == -1){
+		// exit(EXIT_FAILURE);
+	// }
+// }
+
+//Uses same Semaphore as above since both regulate when a process can change resources
+//But the area this is used doesn't require a condition to continue
+d384 9
+d394 1
+a394 1
+*$Date: 2016/04/17 02:43:50 $
+d396 3
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d22 3
+a24 1
+double currTime, arrivalTime, startTime, endTime, turnAround, currRunTime;
+d76 2
+a77 1
+	// fprintf(stdout,"ENTER %d Running time: %.9f\n",processId, currRunTime);
+d90 4
+a93 6
+			// processBlock->maxClaim[processId][r] = -1;
+			// processBlock->release[processId][r] = processBlock->release[processId][r] + processBlock->allocated[processId][r];
+			// if(inQueue(20, 18, resource->suspended, r, processId)){//If process suspended in a queue, remove it
+				// int id = selectFromQueue(resource->suspended[r], &resource->suspTail[processBlock->requesting[processId]], processId);
+				// fprintf(stdout,"Process %d Removed from %d Queue\n", id, r);
+			// }
+d99 1
+a99 1
+		// fprintf(stdout,"%d: arrivalTime %.9f, endTime %.9f, turnAround: %.9f, cpuTimeUsed: %.9f\n", processId, arrivalTime, endTime, processBlock->turnAround[processId], processBlock->cpuTimeUsed[processId]);
+d107 7
+a113 3
+processBlock->action = rand() % 2;//Determine if process will read or write. 0 = read, 1 = write
+memWant = 1;
+// memWant = rand() % 32;//Pick a random page from PT to use
+d115 14
+a128 3
+fprintf(stdout,"%d: signaling: %d\n", processId, processBlock->processSignaling);
+while(processBlock->processSignaling != -1){
+	waitRequest(processBlock->processSignaling);//Only one can deallocate at a time
+d130 8
+d139 1
+d249 1
+a249 1
+int inQueue(int p, int suspended[p], int processId){
+d327 3
+a329 2
+void waitRequest(int processRequesting){
+	if(processRequesting == -1){
+d368 6
+a373 3
+/*$Author$
+*$Date$
+*$Log$
+@
